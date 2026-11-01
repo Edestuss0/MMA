@@ -65,6 +65,30 @@ async fn main() {
         panic!();
     }
 
+    router.register_on_channel_connect_handler({
+        let handle = handle.clone();
+
+        move |req, conn_id| {
+            let handle = handle.clone();
+
+            async move {
+                connect(req, conn_id, handle).await;
+            }
+        }
+    });
+
+     router.register_on_channel_disconnect_handler({
+        let handle = handle.clone();
+
+        move |req, conn_id| {
+            let handle = handle.clone();
+
+            async move {
+                disconnect(req, conn_id, handle).await;
+            }
+        }
+    });
+
     if router
         .register_route(String::from("CHANGE"), {
             let handle = handle.clone();
@@ -140,6 +164,30 @@ async fn send(req: Request, _: u32, handle: ServerHandle) {
 
     let mut response = Response::new(0);
     response.payload = payload;
+
+    let _ = handle.send_to_channel(0, response);
+}
+
+async fn disconnect(req: Request, conn_id: u32, handle: ServerHandle) {
+     let payload = match str::from_utf8(&req.payload) {
+        Ok(v) => v,
+        Err(_) => "Invalid data",
+    };
+
+    let mut response = Response::new(0);
+    response.payload = Bytes::from(format!("Disconnect: payload: {}, id: {}", payload, conn_id));
+
+    let _ = handle.send_to_channel(0, response);
+}
+
+async fn connect(req: Request, conn_id: u32, handle: ServerHandle) {
+     let payload = match str::from_utf8(&req.payload) {
+        Ok(v) => v,
+        Err(_) => "Invalid data",
+    };
+
+    let mut response = Response::new(0);
+    response.payload = Bytes::from(format!("Connect: payload: {}, id: {}", payload, conn_id));
 
     let _ = handle.send_to_channel(0, response);
 }

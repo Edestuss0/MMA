@@ -9,7 +9,7 @@ use bytes::Bytes;
 use std::io;
 use thiserror::Error;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Request {
     pub headers: RequestHeaders,
     pub payload: Bytes,

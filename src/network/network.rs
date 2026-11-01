@@ -4,6 +4,7 @@ use crate::core::commands::Request;
 use crate::core::commands::RequestOpcode;
 use crate::core::commands::Response;
 use crate::core::config::Config;
+use crate::core::router::ReservedRoutes;
 use crate::core::router::Router;
 use crate::protocol::framer::Framer;
 use bytes::Bytes;
@@ -85,11 +86,14 @@ pub async fn serve_connection<F>(
 
     let mut writer = writer(sink, rx, config.max_batch);
 
+    let disconnect = CancellationToken::new();
+
     loop {
         let frame = tokio::select! {
             biased;
             _ = kill.cancelled() => break,
             _ = stop.cancelled() => break,
+            _ = disconnect.cancelled() => break,
             changed = config_receiver.changed() => {
                 if changed.is_err() {
                     break;
@@ -134,6 +138,8 @@ pub async fn serve_connection<F>(
                 let channel_task_for_cmd = Arc::clone(&channel_task);
                 let tx_for_channel = tx_copy.clone();
 
+                let disconnect = disconnect.clone();
+
                 inflight.spawn(async move {
                     match tokio::time::timeout(
                         request_timeout,
@@ -142,12 +148,12 @@ pub async fn serve_connection<F>(
                             socket_status,
                             permit_global,
                             router,
-                            Arc::new(move || -> SocketStatus {
+                            Arc::new(move || -> (SocketStatus, Option<u32>) {
                                 let (status, mut receiver) = on_channel_connect();
 
                                 let conn_id = match status {
                                     SocketStatus::Channel(id) => id,
-                                    _ => return status,
+                                    _ => return (status, None)
                                 };
 
                                 let tx_channel = tx_for_channel.clone();
@@ -188,7 +194,10 @@ pub async fn serve_connection<F>(
                                     }
                                 }
 
-                                status
+                                (status, Some(conn_id))
+                            }),
+                            Arc::new(move || {
+                                disconnect.cancel();
                             })
                         ),
                     )
@@ -260,15 +269,17 @@ pub async fn serve_connection<F>(
     }
 }
 
-async fn handle_cmd<F>(
+async fn handle_cmd<F, T>(
     cmd: Request,
     socket_status: Arc<AtomicU64>,
     permit: OwnedSemaphorePermit,
     router: Arc<Router>,
     on_channel_connect: Arc<F>,
+    on_channel_disconnect: Arc<T>
 ) -> Option<Response>
 where
-    F: Fn() -> SocketStatus + Send + Sync + 'static,
+    F: Fn() -> (SocketStatus, Option<u32>) + Send + Sync + 'static,
+    T: Fn() -> () + Send + Sync + 'static,
 {
     let req_id = cmd.headers.req_id;
 
@@ -290,14 +301,24 @@ where
                 return Some(response);
             }
             RequestOpcode::ChannelConnect => {
-                socket_status.store(
-                    SocketStatus::to_u64(on_channel_connect()),
-                    Ordering::Relaxed,
-                );
-                drop(permit);
-                return Some(Response::channel_connected(req_id));
+                let (status, id) = on_channel_connect();
+                if cmd.route.to_uppercase() == ReservedRoutes::CHANNEL_CONNECT.to_string().to_uppercase() {
+                    socket_status.store(
+                        SocketStatus::to_u64(status),
+                        Ordering::Relaxed,
+                    );
+                    if id.is_some() {router.on_channel_connect(cmd, id.unwrap()).await;} 
+                    drop(permit);
+                    return Some(Response::channel_connected(req_id));
+                } else {
+                    drop(permit);
+                    return Some(Response::bad_request(req_id, Some(Bytes::from("Route must be doesn't match by opcode"))));
+                }
             }
             RequestOpcode::ChannelMessage => {
+                if cmd.route.to_uppercase() == ReservedRoutes::CHANNEL_DISCONNECT.to_string().to_uppercase() {
+                    
+                }
                 drop(permit);
                 return Some(Response::bad_request(
                     req_id,
@@ -330,6 +351,20 @@ where
                 ));
             }
             RequestOpcode::ChannelMessage => {
+                if cmd.route.to_uppercase() == ReservedRoutes::CHANNEL_DISCONNECT.to_string().to_uppercase() {
+                    let id = match SocketStatus::from_u64(socket_status.load(Ordering::Relaxed)) {
+                        SocketStatus::Channel(i) => i,
+                        _ => {
+                                return Some(Response::bad_request(
+                                req_id,
+                                Some(Bytes::from("Channel not connected")),
+                            ));
+                        }
+                    };
+
+                    router.on_channel_disconnect(cmd.clone(), id).await;
+                    on_channel_disconnect()
+                }
                 match AssertUnwindSafe(router.handle_channel(cmd, &conn_id))
                     .catch_unwind()
                     .await

@@ -6,14 +6,15 @@ use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use std::str::FromStr;
 use std::sync::Arc;
-use strum_macros::EnumString;
+use strum_macros::{Display, EnumString};
 
 type Handler = Arc<dyn for<'a> Fn(Request, Response) -> BoxFuture<'static, Response> + Send + Sync>;
 type ChannelHandler = Arc<dyn Fn(Request, u32) -> BoxFuture<'static, ()> + Send + Sync>;
 
-#[derive(Debug, PartialEq, EnumString)]
-enum ReservedRoutes {
+#[derive(Debug, PartialEq, EnumString, Display)]
+pub enum ReservedRoutes {
     CHANNEL_CONNECT,
+    CHANNEL_DISCONNECT,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -30,6 +31,8 @@ pub enum RouteError {
 pub struct Router {
     routes: AHashMap<String, Handler>,
     channel_handlers: AHashMap<String, ChannelHandler>,
+    on_channel_connect_handler: Option<ChannelHandler>,
+    on_channel_disconnect_handler: Option<ChannelHandler>
 }
 
 impl Router {
@@ -37,6 +40,8 @@ impl Router {
         Self {
             routes: AHashMap::new(),
             channel_handlers: AHashMap::new(),
+            on_channel_connect_handler: None,
+            on_channel_disconnect_handler: None
         }
     }
     pub fn register_route<F, Fut>(&mut self, route: String, handler: F) -> Result<(), RouteError>
@@ -94,6 +99,36 @@ impl Router {
         Result::Ok(())
     }
 
+    pub fn register_on_channel_connect_handler<F, Fut>(
+        &mut self,
+        handler: F,
+    )
+    where
+        F: Fn(Request, u32) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let handler: ChannelHandler = Arc::new(move |req, conn_id| -> BoxFuture<'static, ()> {
+            Box::pin(handler(req, conn_id))
+        });
+
+        self.on_channel_connect_handler = Some(handler);
+    }
+
+    pub fn register_on_channel_disconnect_handler<F, Fut>(
+        &mut self,
+        handler: F,
+    )
+    where
+        F: Fn(Request, u32) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let handler: ChannelHandler = Arc::new(move |req, conn_id| -> BoxFuture<'static, ()> {
+            Box::pin(handler(req, conn_id))
+        });
+
+        self.on_channel_disconnect_handler = Some(handler);
+    }
+
     pub fn validate_version(frame: &Request) -> Result<(), Response> {
         if frame.headers.version != MMA_VERSION {
             return Err(Response {
@@ -129,6 +164,24 @@ impl Router {
                 options: vec![],
             },
         }
+    }
+
+    pub async fn on_channel_connect(&self, request: Request, conn_id: u32) {
+        match &self.on_channel_connect_handler {
+            Some(h) => {
+                h(request, conn_id).await;
+            },
+            _ => {}
+        };
+    }
+
+    pub async fn on_channel_disconnect(&self, request: Request, conn_id: u32) {
+        match &self.on_channel_disconnect_handler {
+            Some(h) => {
+                h(request, conn_id).await;
+            },
+            _ => {}
+        };
     }
 
     pub async fn handle_channel(&self, frame: Request, conn_id: &u32) -> Result<(), Response> {

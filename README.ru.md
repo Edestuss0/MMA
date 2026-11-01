@@ -8,7 +8,7 @@
 
 </div>
 
-> **Статус:** pre-release `0.1.0` · версия wire-протокола `1` · API и C ABI могут меняться без предупреждения.
+> **Статус:** pre-release `0.1.0` · версия wire-протокола `1` · API и C ABI могут меняться без предупреждения. История изменений: [CHANGELOG.ru.md](CHANGELOG.ru.md).
 
 MMA — приватный бинарный протокол поверх TCP с режимами запрос/ответ и channel. Главная особенность: **единого фиксированного wire-формата нет.** Раскладка байтов кадра определяется конфигурацией (`FramerConfig`), общей для обеих сторон, поэтому два развёртывания с разными конфигурациями выглядят на проводе как два разных несовместимых протокола.
 
@@ -26,8 +26,7 @@ MMA — приватный бинарный протокол поверх TCP с
 - [8. C ABI](#8-c-abi)
 - [9. Совместимость и версионирование](#9-совместимость-и-версионирование)
 - [10. Безопасность](#10-безопасность)
-- [11. Статус и известные ограничения](#11-статус-и-известные-ограничения)
-- [12. Структура репозитория](#12-структура-репозитория)
+- [11. Структура репозитория](#11-структура-репозитория)
 
 ---
 
@@ -217,16 +216,16 @@ frame_len = header_length + body_len                 (checked-сложение)
 
 | Название | Код | Допустимо в состоянии | Назначение |
 |---|---:|---|---|
-| `ChannelConnect` | 1 | `Fresh` | Перевести соединение в режим Channel |
+| `ChannelConnect` | 1 | `Fresh` | Перевести соединение в режим Channel; route **обязан** быть `CHANNEL_CONNECT` ([§5.5](#55-зарезервированные-маршруты-и-хуки-жизненного-цикла-соединения)) |
 | `Once` | 2 | `Fresh`, `Once` | Запрос обрабатывается route-обработчиком; один ответ |
-| `ChannelMessage` | 3 | `Channel` | Сообщение channel-обработчику; при успехе ответа нет |
+| `ChannelMessage` | 3 | `Channel` | Сообщение channel-обработчику; при успехе ответа нет. Route `CHANNEL_DISCONNECT` зарезервирован ([§5.5](#55-зарезервированные-маршруты-и-хуки-жизненного-цикла-соединения)) |
 
 **Ответы (сервер → клиент)**
 
 | Название | Код | Значение | Когда отправляется |
 |---|---:|---|---|
 | `Ok` | 1 | Успех | Статус ответа по умолчанию |
-| `BadRequest` | 2 | Некорректный запрос | Ошибка декодирования; неверная версия; channel-сообщение без канала |
+| `BadRequest` | 2 | Некорректный запрос | Ошибка декодирования; неверная версия; channel-сообщение без канала; `ChannelConnect` с route не `CHANNEL_CONNECT` |
 | `Unauthorized` | 3 | Не авторизован | Выставляет ваш обработчик |
 | `Forbidden` | 4 | Запрещено | Выставляет ваш обработчик |
 | `NotFound` | 5 | Route не найден | payload `"No such method"` |
@@ -345,6 +344,7 @@ options_key_first = false:  [key_len u16 BE][value_len u16 BE][value][key]
 - Route — UTF-8 строка до 255 байт, чувствительна к регистру.
 - Неизвестный route → `NotFound` (`"No such method"`); соединение остаётся открытым.
 - Повторная регистрация того же route (в том числе между request- и channel-обработчиками) — ошибка.
+- Два имени route **зарезервированы** под жизненный цикл канала: `CHANNEL_CONNECT` и `CHANNEL_DISCONNECT` ([§5.5](#55-зарезервированные-маршруты-и-хуки-жизненного-цикла-соединения)). Сравниваются без учёта регистра.
 
 ### 5.2. Состояния соединения
 
@@ -360,12 +360,14 @@ options_key_first = false:  [key_len u16 BE][value_len u16 BE][value][key]
 | Состояние | Запрос | Результат | Новое состояние |
 |---|---|---|---|
 | `Fresh` | `Once` | route-обработчик | `Once` |
-| `Fresh` | `ChannelConnect` | `ChannelConnected` | `Channel` |
+| `Fresh` | `ChannelConnect`, route `CHANNEL_CONNECT` | `ChannelConnected`; запускается connect-хук | `Channel` |
+| `Fresh` | `ChannelConnect`, любой другой route | `BadRequest` («Route must be doesn't match by opcode») | `Fresh` |
 | `Fresh` | `ChannelMessage` | `BadRequest` («Channel not connected») | `Fresh` |
 | `Once` | `Once` | route-обработчик | `Once` |
 | `Once` | `ChannelConnect` / `ChannelMessage` | `BadRequest` (несовпадение типа) | `Once` |
 | `Channel` | `ChannelConnect` | `Conflict` | `Channel` |
 | `Channel` | `ChannelMessage` | channel-обработчик | `Channel` |
+| `Channel` | `ChannelMessage`, route `CHANNEL_DISCONNECT` | запускается disconnect-хук, затем соединение закрывается; см. [§5.5](#55-зарезервированные-маршруты-и-хуки-жизненного-цикла-соединения) | закрывается |
 | `Channel` | `Once` | `BadRequest` (несовпадение типа) | `Channel` |
 
 Используйте один режим на соединение и не отправляйте `Once` и `ChannelConnect` одновременно на новом соединении.
@@ -388,6 +390,25 @@ options_key_first = false:  [key_len u16 BE][value_len u16 BE][value][key]
 - Очередь рассылки — 1024 сообщения. Медленный получатель теряет сообщения (`Lagged`).
 - Push-сообщения и обычные ответы идут через одну исходящую очередь; их взаимный порядок не гарантируется.
 
+### 5.5. Зарезервированные маршруты и хуки жизненного цикла соединения
+
+Два имени route несут жизненный цикл канала. Оба сравниваются без учёта регистра.
+
+| Route | Opcode | Направление | Эффект |
+|---|---|---|---|
+| `CHANNEL_CONNECT` | `ChannelConnect` (1) | клиент → сервер | открывает режим Channel; затем сервер запускает **connect-хук** с запросом (доступны payload и options) и новым `conn_id` |
+| `CHANNEL_DISCONNECT` | `ChannelMessage` (3) | клиент → сервер | запускает **disconnect-хук** с запросом и `conn_id`, затем сервер перестаёт читать это соединение и закрывает его |
+
+Поведение:
+
+- `ChannelConnect` с любым другим route возвращает `BadRequest`. Клиенты, написанные под прежние сборки и отправлявшие произвольный route, теперь должны отправлять `CHANNEL_CONNECT`.
+- `CHANNEL_DISCONNECT` учитывается только в состоянии `Channel`; иначе ответ — `BadRequest` («Channel not connected»).
+- Хуки необязательны. Без зарегистрированного хука служебный route работает, но пользовательский код не вызывается.
+- Хук получает копию `Request` клиентского кадра; он ничего не возвращает и не может отклонить соединение.
+- После disconnect-хука кадр всё равно попадает в маршрутизацию channel-обработчиков. Если обработчик с именем `CHANNEL_DISCONNECT` не зарегистрирован, клиент перед закрытием получит `NotFound` («No such method»). Этот ответ можно игнорировать.
+- Соединение закрывается после завершения активных задач (около `drain_timeout` плюс сброс writer; при `drain_timeout` = 2 с в примере наблюдалось ≈ 4 с).
+- Обрыв TCP-соединения (без кадра `CHANNEL_DISCONNECT`) disconnect-хук **не** запускает.
+
 ---
 
 ## 6. Ошибки
@@ -398,6 +419,7 @@ options_key_first = false:  [key_len u16 BE][value_len u16 BE][value][key]
 | Неверная версия | `BadRequest` | запроса | открыто | нет |
 | Неизвестный route | `NotFound` | запроса | открыто | нет |
 | Режим не подходит opcode | `BadRequest` | запроса | открыто | нет |
+| `ChannelConnect` с route не `CHANNEL_CONNECT` | `BadRequest` | запроса | открыто | нет — использовать зарезервированный route |
 | Повторный `ChannelConnect` | `Conflict` | запроса | открыто | нет |
 | Panic обработчика | `InternalError` | запроса | открыто | зависит от операции |
 | Таймаут обработчика | `Timeout` | запроса | открыто | если идемпотентно |
@@ -505,6 +527,29 @@ router.register_route("COUNT", {
 })?;
 ```
 
+Хуки жизненного цикла соединения (необязательные, см. [§5.5](#55-зарезервированные-маршруты-и-хуки-жизненного-цикла-соединения)):
+
+```rust
+router.register_on_channel_connect_handler({
+    let handle = handle.clone();
+    move |req: Request, conn_id: u32| {
+        let handle = handle.clone();
+        async move {
+            let mut msg = Response::new(0);
+            msg.headers.opcode = ResponseOpcode::ChannelMessage;
+            msg.payload = Bytes::from(format!("connected: {conn_id}, payload: {} bytes", req.payload.len()));
+            let _ = handle.send_to_channel(0, msg);
+        }
+    }
+});
+
+router.register_on_channel_disconnect_handler(|req: Request, conn_id: u32| async move {
+    // здесь освободите состояние соединения
+});
+```
+
+Оба метода имеют сигнатуру `Fn(Request, u32) -> impl Future<Output = ()>` и не возвращают `Result`. Повторная регистрация заменяет прежний хук. Имена зарезервированных route экспортируются как `router::ReservedRoutes` (`CHANNEL_CONNECT`, `CHANNEL_DISCONNECT`). `Request` теперь реализует `Clone`.
+
 Не блокируйте поток в обработчиках: `request_timeout` не отменяет блокирующий код, а он занимает worker рантайма. Для блокирующей и тяжёлой CPU-работы используйте `tokio::task::spawn_blocking`.
 
 ### 7.4. Жизненный цикл сервера
@@ -527,6 +572,7 @@ router.register_route("COUNT", {
 |---|---|---|
 | `Server::new` | `io::Error` | неверная конфигурация или ошибка bind |
 | `Router::register_route` / `register_channel_handler` | `Err` | пустой или слишком длинный route, дубликат |
+| `Router::register_on_channel_connect_handler` / `register_on_channel_disconnect_handler` | — | не возвращают ошибок; повторный вызов заменяет хук |
 | `ServerHandle::send_to_channel` | `Err(())` | нет подписчиков |
 | `Config::validate` | `ConfigError` | нулевой лимит, порт 0, неверный `FramerConfig` |
 | `Server::run` / `run_until` | `io::Error` | ошибка listener/accept |
@@ -545,6 +591,8 @@ router.register_route("COUNT", {
 | `mma_server_create` | проверяет конфигурацию, создаёт сервер (bind ещё нет) | освобождать `mma_server_destroy` |
 | `mma_server_register_route` | регистрирует обработчик запрос/ответ | до `start`; route копируется |
 | `mma_server_register_channel_handler` | регистрирует channel-обработчик | до `start` |
+| `mma_server_register_on_channel_connect_handler` | регистрирует глобальный connect-хук | до `start`; один хук, повторный вызов заменяет его |
+| `mma_server_register_on_channel_disconnect_handler` | регистрирует глобальный disconnect-хук | до `start`; один хук, повторный вызов заменяет его |
 | `mma_server_route` | алиас `mma_server_register_route` | |
 | `mma_server_start` | запускает OS-поток и Tokio runtime, выполняет bind, ждёт готовности | `MMA_OK` только после успешного bind |
 | `mma_server_local_port` | возвращает порт | вызывать после `start` |
@@ -581,16 +629,23 @@ typedef int32_t (*MMA_ChannelHandlerCallback)(
     const MMA_Request *request, uint32_t connection_id, const void *user_data);
 ```
 
+Хуки жизненного цикла тоже используют `MMA_ChannelHandlerCallback`; они регистрируются без имени route и получают запрос `CHANNEL_CONNECT` / `CHANNEL_DISCONNECT` ([§5.5](#55-зарезервированные-маршруты-и-хуки-жизненного-цикла-соединения)):
+
+```c
+mma_server_register_on_channel_connect_handler(server, on_connect, &state);
+mma_server_register_on_channel_disconnect_handler(server, on_disconnect, &state);
+```
+
 Route-callback — **функциональный**: получает пустой `MMA_Response`, применяет вызовы `mma_response_*` (каждый возвращает обновлённый response) и возвращает его.
 
 Правила:
 
 - Данные `request` (`payload`, `route`, `options`) **заимствованы и действительны только во время callback**. Нужное — копируйте.
-- Callbacks выполняются **параллельно на worker-потоках Tokio**. Синхронизируйте общий `user_data` и держите его живым до возврата `mma_server_stop`.
-- **Не блокируйте** callback: он занимает worker рантайма, а `request_timeout` его не прервёт.
+- Callbacks выполняются **параллельно в blocking-пуле Tokio**, а не на асинхронных worker-потоках. Одновременно работает не более `min(max_in_flight, 128)` C-callbacks (route, channel-обработчики и хуки вместе); остальные запросы ждут свободный слот, и это ожидание входит в `request_timeout`. Синхронизируйте общий `user_data` и держите его живым до возврата `mma_server_stop`.
+- Медленный callback больше не блокирует асинхронные worker-ы, но удерживает свой слот до возврата: по `request_timeout` клиент получает `Timeout`, но сама C-функция не прерывается.
 - Не вызывайте `mma_server_*` из callback; не выбрасывайте исключения C++ и не делайте `longjmp` наружу.
 - Чтобы сообщить об ошибке, верните response с `inner == NULL` (или пусть сработает ошибка setter) — клиент получит `InternalError`.
-- Возвращаемое значение channel-callback сейчас игнорируется.
+- Возвращаемое значение callback-ов channel и хуков клиенту не передаётся; значение, отличное от `MMA_OK`, только пишется в stderr.
 - Владение: внутри route-callback response принадлежит библиотеке — верните его, не уничтожайте. Response, созданный `mma_response_new`, требует ровно один `mma_response_destroy`.
 
 ### 8.4. Строки и буферы
@@ -620,7 +675,7 @@ Route-callback — **функциональный**: получает пусто
 
 - `create` → регистрация маршрутов → `start` → … → `stop` → `destroy`.
 - Не вызывайте `start`, `stop`, `destroy` конкурентно для одного указателя и не используйте указатель после `destroy`. Библиотека не обнаруживает double-free и use-after-free.
-- `mma_server_stop` завершает поток сервера и ждёт его; не гарантирует, что блокирующий callback вернулся.
+- `mma_server_stop` завершает поток сервера и ждёт его. При уничтожении runtime дожидаются уже запущенные C-callbacks, поэтому `stop` может длиться дольше `shutdown_grace`, пока callback не вернулся. Синхронную C-функцию прервать нельзя.
 - `mma_server_handle_change_config`: новые `FramerConfig` и `request_timeout` подхватываются соединениями; `max_batch`, `max_connections`, `max_in_flight`, адрес listener и `shutdown_grace` **не** обновляются. Смена wire-параметров без одновременного переключения клиентов ломает разбор.
 
 ### 8.7. Пример
@@ -650,9 +705,9 @@ Wire-раскладка задаётся через `config.framer` (`MMA_Framer
 |---|---|---|
 | Wire-протокол | `MMA_VERSION = 1` | повышается при несовместимых изменениях кадра или семантики |
 | Rust crate | `0.1.0` | до 1.0 breaking-изменения возможны в любом релизе |
-| C ABI / `mma.h` | без версии | сигнатуры могут меняться; запроса версии в рантайме нет |
+| C ABI / `mma.h` | без версии | дополнения с последнего коммита обратно совместимы (две новые функции); запроса версии в рантайме нет |
 
-Два участника совместимы по wire, только если совпадают `MMA_VERSION` **и** весь `FramerConfig`. Новые opcode или обязательное поле требуют новой `MMA_VERSION`; старый сервер закрывает соединение при неизвестном opcode запроса.
+Два участника совместимы по wire, только если совпадают `MMA_VERSION` **и** весь `FramerConfig`. Замечание: правило зарезервированного route для `ChannelConnect` ([§5.5](#55-зарезервированные-маршруты-и-хуки-жизненного-цикла-соединения)) меняет семантику запроса, не меняя раскладку кадра и `MMA_VERSION`; см. [CHANGELOG.ru.md](CHANGELOG.ru.md). Новые opcode или обязательное поле требуют новой `MMA_VERSION`; старый сервер закрывает соединение при неизвестном opcode запроса.
 
 ---
 
@@ -672,40 +727,19 @@ Wire-раскладка задаётся через `config.framer` (`MMA_Framer
 
 Пока не покрыто: idle/read/write-таймауты (атаки медленными клиентами), глобальный лимит байт в полёте и защита от клиентов, не читающих ответы (см. ниже).
 
----
-
-## 11. Статус и известные ограничения
-
-MMA — pre-release. Известные проблемы текущей версии:
-
-| Ограничение | Последствие | Обходной путь |
-|---|---|---|
-| Состояние соединения хранится в общем атомике; состояние `Once` распознаётся ненадёжно, одновременная смена режимов может гоняться | `Once` → `ChannelConnect` может пройти; два режима можно включить одновременно | один режим на соединение |
-| Нет idle-, read- и write-таймаутов | медленные или молчащие клиенты удерживают соединения | таймауты на прокси/файрволе |
-| Клиент, не читающий ответы, может остановить обработчики и исчерпать `max_in_flight` | отказ в обслуживании | ограничивать клиентов на прокси |
-| Ответ, который нельзя закодировать (например, больше `max_message_length`), останавливает запись в соединение | клиент перестаёт получать ответы | держать ответы в пределах лимита |
-| Блокирующий код, включая блокирующие C-callbacks, не отменяется `request_timeout` | блокируются worker-потоки | короткие callbacks; блокирующую работу выносить |
-| Рассылка всем соединениям с фильтрацией на стороне каждого | O(число соединений) на push | — |
-| Нет рукопожатия конфигурации | несовпадающие конфигурации ломаются непредсказуемо | сверять конфигурации вне протокола |
-| Закрытие соединения после некорректного кадра предусмотрено, но не покрыто автотестами | — | — |
-| `Shutdown` (9) определён, но не отправляется | клиент не получает уведомления об остановке | — |
-| Порт 0 отклоняется `Config::validate`, в том числе для C и `from_listener` | нет эфемерного порта | выбрать фиксированный порт |
-| Нет Rust-клиента; тесты кодека отключены; в репозитории нет бенчмарков и фаззинга | — | писать клиент по [§3](#3-формат-кадра) |
-| C: владение `MMA_Response` при ошибке setter хрупкое; дубликаты регистраций из C могут молча пропасть при старте | — | регистрировать каждый route один раз; проверять коды возврата |
-| C: нет запроса версии ABI; константность указателя user-data в `MMA_ChannelHandlerCallback` различается в Rust и заголовке | — | — |
-
-Цифры throughput и latency не публикуются: воспроизводимого бенчмарка в репозитории пока нет. `max_connections = 128 000` — лимит, а не измеренная ёмкость.
 
 ---
 
-## 12. Структура репозитория
+## 11. Структура репозитория
 
 | Путь | Содержимое |
 |---|---|
 | `src/protocol/framer.rs` | энкодер/декодер кадров (приватный) |
 | `src/network/network.rs` | цикл соединения, машина состояний (приватный) |
-| `src/core/` | `commands` (Request/Response), `config`, `router`, `server` |
+| `src/core/` | `commands` (Request/Response), `config`, `router` (маршруты, обработчики, хуки жизненного цикла), `server` |
 | `src/c_api.rs` | экспорты C ABI |
 | `include/mma.h` | C-заголовок |
-| `examples/main_server.rs`, `examples/main_server.c` | примеры Rust- и C-сервера |
+| `examples/main_server.rs`, `examples/main_server.c` | примеры Rust- и C-сервера (Rust-пример также показывает connect/disconnect-хуки) |
+| `mma_gui_client.py` | тестовый клиент на Tkinter (стандартная библиотека Python): настраиваемая раскладка, все три opcode, самотест кодека |
+| `CHANGELOG.md`, `CHANGELOG.ru.md` | история изменений с влиянием на wire / Rust API / C ABI |
 | `tests/` | тесты конфигурации (тесты кодека сейчас отключены) |

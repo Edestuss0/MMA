@@ -8,7 +8,7 @@
 
 </div>
 
-> **Status:** pre-release `0.1.0` · wire protocol version `1` · the API and the C ABI may change without notice.
+> **Status:** pre-release `0.1.0` · wire protocol version `1` · the API and the C ABI may change without notice. History of changes: [CHANGELOG.md](CHANGELOG.md).
 
 MMA is a private, binary, request/response and channel protocol over TCP. Its defining feature: **there is no single fixed wire format.** The byte layout of a frame is defined by a configuration (`FramerConfig`) that both peers share, so two deployments with different configurations look like two different, incompatible protocols on the wire.
 
@@ -26,8 +26,7 @@ This document specifies the frame format, the connection model, the Rust API and
 - [8. C ABI](#8-c-abi)
 - [9. Compatibility and versioning](#9-compatibility-and-versioning)
 - [10. Security](#10-security)
-- [11. Status and known limitations](#11-status-and-known-limitations)
-- [12. Repository layout](#12-repository-layout)
+- [11. Repository layout](#11-repository-layout)
 
 ---
 
@@ -217,16 +216,16 @@ frame_len = header_length + body_len                 (checked addition)
 
 | Name | Code | Valid in state | Purpose |
 |---|---:|---|---|
-| `ChannelConnect` | 1 | `Fresh` | Switch the connection to Channel mode |
+| `ChannelConnect` | 1 | `Fresh` | Switch the connection to Channel mode; the route **must** be `CHANNEL_CONNECT` ([§5.5](#55-reserved-routes-and-connection-lifecycle-hooks)) |
 | `Once` | 2 | `Fresh`, `Once` | Request handled by a route handler; one response |
-| `ChannelMessage` | 3 | `Channel` | Message for a channel handler; no response on success |
+| `ChannelMessage` | 3 | `Channel` | Message for a channel handler; no response on success. The route `CHANNEL_DISCONNECT` is reserved ([§5.5](#55-reserved-routes-and-connection-lifecycle-hooks)) |
 
 **Response opcodes (server → client)**
 
 | Name | Code | Meaning | Sent when |
 |---|---:|---|---|
 | `Ok` | 1 | Success | Default status of a response |
-| `BadRequest` | 2 | Invalid request | Decode error; wrong version; channel message without a channel |
+| `BadRequest` | 2 | Invalid request | Decode error; wrong version; channel message without a channel; `ChannelConnect` with a route other than `CHANNEL_CONNECT` |
 | `Unauthorized` | 3 | Not authorised | Set by your handler |
 | `Forbidden` | 4 | Forbidden | Set by your handler |
 | `NotFound` | 5 | Unknown route | Payload `"No such method"` |
@@ -345,6 +344,7 @@ Rust access: `Request::get_option(&self, key: &[u8]) -> Option<Bytes>` (no data 
 - A route is a UTF-8 string of at most 255 bytes, case-sensitive.
 - Unknown route → `NotFound` (`"No such method"`); the connection stays open.
 - Registering the same route twice (also across request and channel handlers) is an error.
+- Two route names are **reserved** for the channel lifecycle: `CHANNEL_CONNECT` and `CHANNEL_DISCONNECT` ([§5.5](#55-reserved-routes-and-connection-lifecycle-hooks)). They are matched case-insensitively.
 
 ### 5.2. Connection states
 
@@ -360,12 +360,14 @@ Rust access: `Request::get_option(&self, key: &[u8]) -> Option<Bytes>` (no data 
 | State | Request | Result | New state |
 |---|---|---|---|
 | `Fresh` | `Once` | route handler | `Once` |
-| `Fresh` | `ChannelConnect` | `ChannelConnected` | `Channel` |
+| `Fresh` | `ChannelConnect`, route `CHANNEL_CONNECT` | `ChannelConnected`; connect hook runs | `Channel` |
+| `Fresh` | `ChannelConnect`, any other route | `BadRequest` ("Route must be doesn't match by opcode") | `Fresh` |
 | `Fresh` | `ChannelMessage` | `BadRequest` ("Channel not connected") | `Fresh` |
 | `Once` | `Once` | route handler | `Once` |
 | `Once` | `ChannelConnect` / `ChannelMessage` | `BadRequest` (type mismatch) | `Once` |
 | `Channel` | `ChannelConnect` | `Conflict` | `Channel` |
 | `Channel` | `ChannelMessage` | channel handler | `Channel` |
+| `Channel` | `ChannelMessage`, route `CHANNEL_DISCONNECT` | disconnect hook runs, the connection is then closed; see [§5.5](#55-reserved-routes-and-connection-lifecycle-hooks) | closing |
 | `Channel` | `Once` | `BadRequest` (type mismatch) | `Channel` |
 
 Use one mode per connection and do not send `Once` and `ChannelConnect` concurrently on a fresh connection.
@@ -388,6 +390,25 @@ Use one mode per connection and do not send `Once` and `ChannelConnect` concurre
 - The broadcast queue holds 1024 messages. A slow receiver loses messages (`Lagged`).
 - Push messages and regular responses share one outgoing queue; their relative order is not guaranteed.
 
+### 5.5. Reserved routes and connection lifecycle hooks
+
+Two route names carry the channel lifecycle. Both are compared case-insensitively.
+
+| Route | Opcode | Direction | Effect |
+|---|---|---|---|
+| `CHANNEL_CONNECT` | `ChannelConnect` (1) | client → server | opens Channel mode; the server then runs the **connect hook** with the request (payload and options are available) and the new `conn_id` |
+| `CHANNEL_DISCONNECT` | `ChannelMessage` (3) | client → server | runs the **disconnect hook** with the request and the `conn_id`, then the server stops reading from this connection and closes it |
+
+Behaviour:
+
+- Sending `ChannelConnect` with any other route returns `BadRequest`. Clients written for earlier builds that used an arbitrary route must now send `CHANNEL_CONNECT`.
+- `CHANNEL_DISCONNECT` is honoured only in `Channel` state; otherwise the answer is `BadRequest` ("Channel not connected").
+- Hooks are optional. Without a registered hook the lifecycle route still works, it just runs no user code.
+- The hook receives a `Request` copy of the client frame; it returns nothing and cannot reject the connection.
+- After the disconnect hook the frame is still routed to channel handlers. If you did not register a handler named `CHANNEL_DISCONNECT`, the client receives `NotFound` ("No such method") just before the close. Ignore that reply.
+- The connection is closed after the in-flight work drains (about `drain_timeout` plus the writer flush; ≈ 4 s was observed with the example's `drain_timeout` of 2 s).
+- A dropped TCP connection (no `CHANNEL_DISCONNECT` frame) does **not** run the disconnect hook.
+
 ---
 
 ## 6. Errors
@@ -398,6 +419,7 @@ Use one mode per connection and do not send `Once` and `ChannelConnect` concurre
 | Wrong version | `BadRequest` | request | open | no |
 | Unknown route | `NotFound` | request | open | no |
 | Wrong mode for the opcode | `BadRequest` | request | open | no |
+| `ChannelConnect` with a route other than `CHANNEL_CONNECT` | `BadRequest` | request | open | no — use the reserved route |
 | Second `ChannelConnect` | `Conflict` | request | open | no |
 | Handler panic | `InternalError` | request | open | depends on the operation |
 | Handler timeout | `Timeout` | request | open | if idempotent |
@@ -505,6 +527,29 @@ router.register_route("COUNT", {
 })?;
 ```
 
+Connection lifecycle hooks (optional, see [§5.5](#55-reserved-routes-and-connection-lifecycle-hooks)):
+
+```rust
+router.register_on_channel_connect_handler({
+    let handle = handle.clone();
+    move |req: Request, conn_id: u32| {
+        let handle = handle.clone();
+        async move {
+            let mut msg = Response::new(0);
+            msg.headers.opcode = ResponseOpcode::ChannelMessage;
+            msg.payload = Bytes::from(format!("connected: {conn_id}, payload: {} bytes", req.payload.len()));
+            let _ = handle.send_to_channel(0, msg);
+        }
+    }
+});
+
+router.register_on_channel_disconnect_handler(|req: Request, conn_id: u32| async move {
+    // release per-connection state here
+});
+```
+
+Both calls have the signature `Fn(Request, u32) -> impl Future<Output = ()>` and do not return a `Result`. Registering again replaces the previous hook. The reserved route names are also exported as `router::ReservedRoutes` (`CHANNEL_CONNECT`, `CHANNEL_DISCONNECT`). `Request` now implements `Clone`.
+
 Do not block inside handlers: `request_timeout` cannot cancel blocking code, and it occupies a runtime worker. Use `tokio::task::spawn_blocking` for blocking or CPU-heavy work.
 
 ### 7.4. Server lifecycle
@@ -527,6 +572,7 @@ Shutdown: accepting stops, readers stop, running handlers get `shutdown_grace`, 
 |---|---|---|
 | `Server::new` | `io::Error` | invalid config or bind failure |
 | `Router::register_route` / `register_channel_handler` | `Err` | empty or too long route, duplicate route |
+| `Router::register_on_channel_connect_handler` / `register_on_channel_disconnect_handler` | — | infallible; a new call replaces the old hook |
 | `ServerHandle::send_to_channel` | `Err(())` | no subscribers |
 | `Config::validate` | `ConfigError` | zero limit, port 0, invalid `FramerConfig` |
 | `Server::run` / `run_until` | `io::Error` | listener/accept failure |
@@ -545,6 +591,8 @@ Header: [`include/mma.h`](include/mma.h). Library: `libMMA.so` / `libMMA.dylib` 
 | `mma_server_create` | validate the config, create a server (no bind yet) | free with `mma_server_destroy` |
 | `mma_server_register_route` | register a request/response handler | before `start`; the route is copied |
 | `mma_server_register_channel_handler` | register a channel handler | before `start` |
+| `mma_server_register_on_channel_connect_handler` | register the global connect hook | before `start`; one hook, a repeated call replaces it |
+| `mma_server_register_on_channel_disconnect_handler` | register the global disconnect hook | before `start`; one hook, a repeated call replaces it |
 | `mma_server_route` | alias of `mma_server_register_route` | |
 | `mma_server_start` | start an OS thread and a Tokio runtime, bind, wait for readiness | `MMA_OK` only after a successful bind |
 | `mma_server_local_port` | return the port | call after `start` |
@@ -581,16 +629,23 @@ typedef int32_t (*MMA_ChannelHandlerCallback)(
     const MMA_Request *request, uint32_t connection_id, const void *user_data);
 ```
 
+Lifecycle hooks use `MMA_ChannelHandlerCallback` too; they are registered without a route name and receive the `CHANNEL_CONNECT` / `CHANNEL_DISCONNECT` request ([§5.5](#55-reserved-routes-and-connection-lifecycle-hooks)):
+
+```c
+mma_server_register_on_channel_connect_handler(server, on_connect, &state);
+mma_server_register_on_channel_disconnect_handler(server, on_disconnect, &state);
+```
+
 A route callback is **functional**: it receives an empty `MMA_Response`, applies `mma_response_*` calls (each returns the updated response) and returns it.
 
 Rules:
 
 - `request` data (`payload`, `route`, `options`) is **borrowed and valid only during the callback**. Copy what you need.
-- Callbacks run **concurrently on Tokio worker threads**. Synchronise shared `user_data`, and keep it alive until `mma_server_stop` returns.
-- **Do not block** in a callback: it occupies a runtime worker and `request_timeout` cannot interrupt it.
+- Callbacks run **concurrently on Tokio's blocking thread pool**, not on async worker threads. At most `min(max_in_flight, 128)` C callbacks (routes, channel handlers and hooks together) run at the same time; further requests wait for a slot, and that wait counts against `request_timeout`. Synchronise shared `user_data`, and keep it alive until `mma_server_stop` returns.
+- A slow callback no longer blocks async workers, but it keeps its slot until it returns: `request_timeout` answers the client with `Timeout`, it cannot interrupt the C function.
 - Do not call `mma_server_*` from a callback; do not throw C++ exceptions or `longjmp` out of one.
 - Return a response with `inner == NULL` (or fail a setter) to signal an error; the client gets `InternalError`.
-- The channel callback's return value is currently ignored.
+- The return value of channel and hook callbacks is not sent to the client; a value other than `MMA_OK` is only logged to stderr.
 - Ownership: inside a route callback the response belongs to the library — return it, never destroy it. A response made with `mma_response_new` needs exactly one `mma_response_destroy`.
 
 ### 8.4. Strings and buffers
@@ -620,7 +675,7 @@ Rules:
 
 - `create` → register routes → `start` → … → `stop` → `destroy`.
 - Do not call `start`, `stop` or `destroy` concurrently on the same pointer, and do not use a pointer after `destroy`. The library cannot detect double-free or use-after-free.
-- `mma_server_stop` makes the server thread exit and joins it; it does not guarantee that a blocking callback has returned.
+- `mma_server_stop` makes the server thread exit and joins it. Dropping the runtime waits for C callbacks that are already running, so `stop` can take longer than `shutdown_grace` while a callback has not returned. A synchronous C function cannot be interrupted.
 - `mma_server_handle_change_config`: new `FramerConfig` and `request_timeout` are picked up by connections; `max_batch`, `max_connections`, `max_in_flight`, the listen address and `shutdown_grace` are **not** updated. Changing wire parameters without switching clients at the same time breaks parsing.
 
 ### 8.7. Example
@@ -650,9 +705,9 @@ Three versions are independent:
 |---|---|---|
 | Wire protocol | `MMA_VERSION = 1` | bumped on incompatible frame or semantics changes |
 | Rust crate | `0.1.0` | before 1.0, breaking changes may occur in any release |
-| C ABI / `mma.h` | unversioned | signatures may change; no runtime version query |
+| C ABI / `mma.h` | unversioned | additions since the last commit are backward compatible (two new functions); no runtime version query |
 
-Two peers are wire-compatible only if `MMA_VERSION` **and** the whole `FramerConfig` match. Adding opcodes or a mandatory field requires a new `MMA_VERSION`; an old server closes the connection on an unknown request opcode.
+Two peers are wire-compatible only if `MMA_VERSION` **and** the whole `FramerConfig` match. Note: the reserved-route rule for `ChannelConnect` ([§5.5](#55-reserved-routes-and-connection-lifecycle-hooks)) changes request semantics without changing the frame layout or `MMA_VERSION`; see [CHANGELOG.md](CHANGELOG.md). Adding opcodes or a mandatory field requires a new `MMA_VERSION`; an old server closes the connection on an unknown request opcode.
 
 ---
 
@@ -674,38 +729,16 @@ Not covered yet: idle/read/write timeouts (slow-client attacks), a global byte b
 
 ---
 
-## 11. Status and known limitations
-
-MMA is pre-release. Known issues in the current version:
-
-| Limitation | Effect | Workaround |
-|---|---|---|
-| Connection state is stored in a shared atomic; the `Once` state is not reliably recognised and concurrent mode changes can race | `Once` → `ChannelConnect` upgrade may succeed; two modes can be entered at once | use one mode per connection |
-| No idle, read or write timeouts | slow or silent clients hold connections | enforce timeouts at a proxy/firewall |
-| A client that does not read responses can stall handlers and exhaust `max_in_flight` | denial of service | limit clients at a proxy |
-| An unencodable response (e.g. above `max_message_length`) stops writes on that connection | client receives no further responses | keep responses within the limit |
-| Blocking code, including blocking C callbacks, is not cancelled by `request_timeout` | worker threads blocked | keep callbacks short; offload blocking work |
-| Broadcast to all connections is filtered per connection | O(connections) per push | — |
-| No configuration handshake | mismatched configs fail unpredictably | verify configs out of band |
-| Closing the connection after a malformed frame is intended, but not covered by automated tests | — | — |
-| `Shutdown` (9) is defined but never sent | clients get no shutdown notice | — |
-| Port 0 is rejected by `Config::validate`, including for C and `from_listener` | no ephemeral port | choose a fixed port |
-| No Rust client crate; codec tests are disabled; no benchmarks or fuzzing in the repo | — | write a client from [§3](#3-frame-format) |
-| C: `MMA_Response` ownership on setter failure is fragile; duplicate registrations from C can be silently dropped at start | — | register each route once; check return codes |
-| C: no ABI version query; `MMA_ChannelHandlerCallback` user-data pointer constness differs between Rust and the header | — | — |
-
-No throughput or latency figures are published: there is no reproducible benchmark in the repository yet. `max_connections = 128 000` is a limit, not a measured capacity.
-
----
-
-## 12. Repository layout
+## 11. Repository layout
 
 | Path | Contents |
 |---|---|
 | `src/protocol/framer.rs` | frame encoder/decoder (private) |
 | `src/network/network.rs` | per-connection loop, state machine (private) |
-| `src/core/` | `commands` (Request/Response), `config`, `router`, `server` |
+| `src/core/` | `commands` (Request/Response), `config`, `router` (routes, handlers, lifecycle hooks), `server` |
 | `src/c_api.rs` | C ABI exports |
 | `include/mma.h` | C header |
-| `examples/main_server.rs`, `examples/main_server.c` | Rust and C server examples |
+| `examples/main_server.rs`, `examples/main_server.c` | Rust and C server examples (the Rust one also shows the connect/disconnect hooks) |
+| `mma_gui_client.py` | Tkinter test client (Python standard library): configurable layout, all three opcodes, a codec self-test |
+| `CHANGELOG.md` | history of changes with wire / Rust API / C ABI impact |
 | `tests/` | configuration tests (codec tests are currently disabled) |

@@ -127,6 +127,16 @@ int32_t mma_server_register_channel_handler(
     MMA_ChannelHandlerCallback callback,
     const void *user_data
 );
+int32_t mma_server_register_on_channel_connect_handler(
+    MMA_Server *server,
+    MMA_ChannelHandlerCallback callback,
+    const void *user_data
+);
+int32_t mma_server_register_on_channel_disconnect_handler(
+    MMA_Server *server,
+    MMA_ChannelHandlerCallback callback,
+    const void *user_data
+);
 /* Backward-compatible alias for mma_server_register_route. */
 int32_t mma_server_route(
     MMA_Server *server,

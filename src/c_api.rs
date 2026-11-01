@@ -5,13 +5,15 @@ use crate::core::config::{BigBytesConfig, Config, FramerConfig};
 use crate::core::router::Router;
 use crate::core::server::{Server, ServerHandle};
 use bytes::Bytes;
-use std::ffi::{CStr, c_char, c_void};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::ffi::{c_char, c_void, CStr};
+use std::net::{IpAddr, SocketAddr};
 use std::ptr;
 use std::str::FromStr;
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 pub const MMA_OK: i32 = 0;
@@ -19,6 +21,10 @@ pub const MMA_INVALID_ARGUMENT: i32 = -1;
 pub const MMA_INVALID_CONFIG: i32 = -2;
 pub const MMA_SERVER_ERROR: i32 = -3;
 pub const MMA_SERVER_ALREADY_STARTED: i32 = -4;
+
+/// Internal safety limit for simultaneously running synchronous C callbacks.
+/// This does not affect the public C ABI.
+const MMA_MAX_CONCURRENT_C_CALLBACKS: usize = 128;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -33,14 +39,15 @@ pub struct MMA_FramerConfig {
     pub options_count_pos: u8,
     pub options_key_first: u8,
     pub header_length: u8,
-    pub big_bytes_config: MMA_BigBytesConfig
+    pub big_bytes_config: MMA_BigBytesConfig,
 }
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct MMA_BigBytesConfig {
     pub options_len_order: u8,
     pub payload_len_order: u8,
-    pub req_id_order: u8
+    pub req_id_order: u8,
 }
 
 #[repr(C)]
@@ -81,6 +88,7 @@ pub struct MMA_Request {
     pub options: *const MMA_Option,
     pub options_count: usize,
 }
+
 pub struct MMA_ServerHandle {
     inner: ServerHandle,
 }
@@ -90,6 +98,7 @@ pub struct MMA_Response {
     response: *mut Response,
 }
 
+// These signatures are the existing public ABI. They remain synchronous C callbacks.
 pub type MMA_RouteCallback =
     Option<extern "C" fn(MMA_Request, MMA_Response, *const c_void) -> MMA_Response>;
 pub type MMA_ChannelHandlerCallback =
@@ -107,11 +116,20 @@ struct RegisteredChannelHandler {
     user_data: usize,
 }
 
+/// A connection lifecycle callback has the same C signature as a channel
+/// handler, but it is registered globally rather than under a route name.
+struct RegisteredLifecycleHandler {
+    callback: extern "C" fn(*const MMA_Request, u32, *const c_void) -> i32,
+    user_data: usize,
+}
+
 pub struct MMA_Server {
     config: Config,
     bound_port: u16,
     routes: Vec<RegisteredRoute>,
     channel_handlers: Vec<RegisteredChannelHandler>,
+    on_channel_connect_handler: Option<RegisteredLifecycleHandler>,
+    on_channel_disconnect_handler: Option<RegisteredLifecycleHandler>,
     started: bool,
     stop: CancellationToken,
     thread: Option<JoinHandle<()>>,
@@ -122,6 +140,7 @@ fn framer_config_from_c(config: MMA_FramerConfig) -> Option<FramerConfig> {
     if config.options_key_first > 1 {
         return None;
     }
+
     Some(FramerConfig {
         max_message_length: config.max_message_length,
         opcode_pos: config.opcode_pos,
@@ -133,7 +152,11 @@ fn framer_config_from_c(config: MMA_FramerConfig) -> Option<FramerConfig> {
         options_count_pos: config.options_count_pos,
         options_key_first: config.options_key_first != 0,
         header_length: config.header_length,
-        big_bytes_config: BigBytesConfig{options_len_order: config.big_bytes_config.options_len_order, payload_len_order: config.big_bytes_config.payload_len_order , req_id_order: config.big_bytes_config.req_id_order}
+        big_bytes_config: BigBytesConfig {
+            options_len_order: config.big_bytes_config.options_len_order,
+            payload_len_order: config.big_bytes_config.payload_len_order,
+            req_id_order: config.big_bytes_config.req_id_order,
+        },
     })
 }
 
@@ -149,7 +172,11 @@ fn framer_config_to_c(config: &FramerConfig) -> MMA_FramerConfig {
         options_count_pos: config.options_count_pos,
         options_key_first: u8::from(config.options_key_first),
         header_length: config.header_length,
-        big_bytes_config: MMA_BigBytesConfig{options_len_order: config.big_bytes_config.options_len_order, payload_len_order: config.big_bytes_config.payload_len_order , req_id_order: config.big_bytes_config.req_id_order}
+        big_bytes_config: MMA_BigBytesConfig {
+            options_len_order: config.big_bytes_config.options_len_order,
+            payload_len_order: config.big_bytes_config.payload_len_order,
+            req_id_order: config.big_bytes_config.req_id_order,
+        },
     }
 }
 
@@ -158,23 +185,16 @@ fn config_from_c(config: &MMA_ServerConfig) -> Option<Config> {
         return None;
     }
 
-    let ip_str = unsafe {
-        CStr::from_ptr(config.bind_ip)
-    }
-    .to_str()
-    .ok()?;
-
+    // SAFETY: the public C API requires bind_ip to point to a valid NUL-terminated string.
+    let ip_str = unsafe { CStr::from_ptr(config.bind_ip) }.to_str().ok()?;
     let ip_addr = IpAddr::from_str(ip_str).ok()?;
 
     Some(Config {
         address: SocketAddr::new(ip_addr, config.port),
-
         frame_config: framer_config_from_c(config.framer)?,
-
         max_batch: config.max_batch,
         max_connections: config.max_connections,
         max_in_flight: config.max_in_flight,
-
         drain_timeout: Duration::from_millis(config.drain_timeout_ms),
         shutdown_grace: Duration::from_millis(config.shutdown_grace_ms),
         request_timeout: Duration::from_millis(config.request_timeout_ms),
@@ -182,123 +202,300 @@ fn config_from_c(config: &MMA_ServerConfig) -> Option<Config> {
 }
 
 fn valid_slice<T>(data: *const T, len: usize) -> bool {
-    len == 0 || !data.is_null()
+    len == 0 || (!data.is_null() && len <= isize::MAX as usize)
 }
 
 unsafe fn raw_slice<'a, T>(data: *const T, len: usize) -> &'a [T] {
     if len == 0 {
         &[]
     } else {
-        // The C caller must provide a readable allocation of `len` elements.
+        // SAFETY: the caller must guarantee that data points to len readable,
+        // properly aligned elements for the duration of the returned borrow.
         unsafe { std::slice::from_raw_parts(data, len) }
+    }
+}
+
+/// Invoke a route callback on a Tokio blocking-pool thread.
+///
+/// The request and all pointers exposed through MMA_Request remain alive only
+/// until the synchronous C callback returns. A C callback must not retain them.
+fn invoke_c_route(
+    callback: extern "C" fn(MMA_Request, MMA_Response, *const c_void) -> MMA_Response,
+    request: Request,
+    response: Response,
+    route_name: String,
+    user_data: usize,
+) -> Response {
+    let request_id = request.headers.req_id;
+
+    let options: Vec<MMA_Option> = request
+        .options
+        .iter()
+        .map(|(key, value)| MMA_Option {
+            key: key.as_ptr(),
+            key_len: key.len(),
+            value: value.as_ptr(),
+            value_len: value.len(),
+        })
+        .collect();
+
+    let request_view = MMA_Request {
+        route: route_name.as_ptr(),
+        route_len: route_name.len(),
+        opcode: request.headers.opcode as u8,
+        version: request.headers.version,
+        request_id,
+        payload: request.payload.as_ptr(),
+        payload_len: request.payload.len(),
+        options: if options.is_empty() {
+            ptr::null()
+        } else {
+            options.as_ptr()
+        },
+        options_count: options.len(),
+    };
+
+    let response_ptr = Box::into_raw(Box::new(response));
+    let response_view = MMA_Response {
+        response: response_ptr,
+    };
+
+    // The callback is intentionally synchronous, but runs on spawn_blocking's
+    // pool rather than on a Tokio async worker thread.
+    let returned = callback(
+        request_view,
+        response_view,
+        user_data as *const c_void,
+    );
+    let returned_ptr = returned.response;
+
+    if returned_ptr.is_null() {
+        // SAFETY: response_ptr was created by Box::into_raw above and has not
+        // been reclaimed yet. The callback contract forbids destroying it.
+        unsafe { drop(Box::from_raw(response_ptr)) };
+        return Response::internal_error(request_id);
+    }
+
+    if returned_ptr != response_ptr {
+        // The callback returned a replacement response (normally created by
+        // mma_response_new). Reclaim the initial response that it replaced.
+        // SAFETY: response_ptr was allocated above and is still owned here.
+        unsafe { drop(Box::from_raw(response_ptr)) };
+    }
+
+    // SAFETY: the callback contract requires returned_ptr to be either the
+    // original response pointer or a live pointer returned by mma_response_new.
+    unsafe { *Box::from_raw(returned_ptr) }
+}
+
+/// Invoke a channel callback on a Tokio blocking-pool thread.
+///
+/// The MMA_Request view and its backing buffers are valid only for this call.
+fn invoke_c_channel(
+    callback: extern "C" fn(*const MMA_Request, u32, *const c_void) -> i32,
+    request: Request,
+    conn_id: u32,
+    user_data: usize,
+) -> i32 {
+    let options: Vec<MMA_Option> = request
+        .options
+        .iter()
+        .map(|(key, value)| MMA_Option {
+            key: key.as_ptr(),
+            key_len: key.len(),
+            value: value.as_ptr(),
+            value_len: value.len(),
+        })
+        .collect();
+
+    // The route view points into the owned Request, which remains alive until
+    // the synchronous callback returns.
+    let request_view = MMA_Request {
+        route: request.route.as_ptr(),
+        route_len: request.route.len(),
+        opcode: request.headers.opcode as u8,
+        version: request.headers.version,
+        request_id: request.headers.req_id,
+        payload: request.payload.as_ptr(),
+        payload_len: request.payload.len(),
+        options: if options.is_empty() {
+            ptr::null()
+        } else {
+            options.as_ptr()
+        },
+        options_count: options.len(),
+    };
+
+    callback(&request_view, conn_id, user_data as *const c_void)
+}
+
+/// Runs a synchronous C channel/lifecycle callback away from Tokio worker
+/// threads. The semaphore permit is moved into the blocking closure so a
+/// timed-out async waiter cannot release capacity while the C callback is
+/// still executing.
+async fn run_c_channel_callback(
+    callback: extern "C" fn(*const MMA_Request, u32, *const c_void) -> i32,
+    request: Request,
+    conn_id: u32,
+    user_data: usize,
+    callback_semaphore: Arc<Semaphore>,
+    callback_kind: &'static str,
+) {
+    let permit = match callback_semaphore.acquire_owned().await {
+        Ok(permit) => permit,
+        Err(_) => {
+            eprintln!("MMA {callback_kind} callback semaphore is closed");
+            return;
+        }
+    };
+
+    let join = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        invoke_c_channel(callback, request, conn_id, user_data)
+    });
+
+    match join.await {
+        Ok(MMA_OK) => {}
+        Ok(status) => {
+            eprintln!("MMA {callback_kind} callback returned status {status}");
+        }
+        Err(error) => {
+            eprintln!("MMA {callback_kind} callback task failed: {error}");
+        }
     }
 }
 
 fn router_from_registrations(
     routes: &[RegisteredRoute],
     channel_handlers: &[RegisteredChannelHandler],
+    on_channel_connect_handler: Option<&RegisteredLifecycleHandler>,
+    on_channel_disconnect_handler: Option<&RegisteredLifecycleHandler>,
+    c_callback_semaphore: Arc<Semaphore>,
 ) -> Result<Router, String> {
     let mut router = Router::new();
+
     for route in routes {
         let callback = route.callback;
         let route_name = route.route.clone();
         let user_data = route.user_data;
-        let route_name_clone = route_name.clone();
-        router.register_route(
+        let callback_semaphore = Arc::clone(&c_callback_semaphore);
+
+        router
+            .register_route(
                 route.route.clone(),
                 move |request: Request, response: Response| {
-                    let route_name = route_name_clone.clone();
-                    let request_id = request.headers.req_id;
-                    let response_ptr = Box::into_raw(Box::new(response)) as usize;
-                    Box::pin(async move {
-                        let options: Vec<MMA_Option> = request
-                            .options
-                            .iter()
-                            .map(|(key, value)| MMA_Option {
-                                key: key.as_ptr(),
-                                key_len: key.len(),
-                                value: value.as_ptr(),
-                                value_len: value.len(),
-                            })
-                            .collect();
-                        let request_view = MMA_Request {
-                            route: route_name.as_ptr(),
-                            route_len: route_name.len(),
-                            opcode: request.headers.opcode as u8,
-                            version: request.headers.version,
-                            request_id: request.headers.req_id,
-                            payload: request.payload.as_ptr(),
-                            payload_len: request.payload.len(),
-                            options: if options.is_empty() {
-                                ptr::null()
-                            } else {
-                                options.as_ptr()
-                            },
-                            options_count: options.len(),
+                    let route_name = route_name.clone();
+                    let callback_semaphore = Arc::clone(&callback_semaphore);
+
+                    async move {
+                        let request_id = request.headers.req_id;
+
+                        // Waiting for a slot is async and therefore does not block
+                        // a Tokio worker. The request timeout includes this wait.
+                        let permit = match callback_semaphore.acquire_owned().await {
+                            Ok(permit) => permit,
+                            Err(_) => return Response::internal_error(request_id),
                         };
-                        let response_view = MMA_Response {
-                            response: response_ptr as *mut Response,
-                        };
-                        let returned =
-                            callback(request_view, response_view, user_data as *const c_void);
-                        let returned_ptr = returned.response;
-                        
-                        if returned_ptr.is_null() {
-                            unsafe {
-                                drop(Box::from_raw(response_ptr as *mut Response));
+
+                        let join = tokio::task::spawn_blocking(move || {
+                            // Keep the permit until the C function really returns.
+                            // If the request times out, the blocking callback keeps
+                            // running and continues to occupy this slot.
+                            let _permit = permit;
+                            invoke_c_route(
+                                callback,
+                                request,
+                                response,
+                                route_name,
+                                user_data,
+                            )
+                        });
+
+                        match join.await {
+                            Ok(response) => response,
+                            Err(error) => {
+                                eprintln!("MMA C route callback task failed: {error}");
+                                Response::internal_error(request_id)
                             }
-                            Response::internal_error(request_id)
-                        } else {
-                            unsafe { *Box::from_raw(returned_ptr) }
                         }
-                    })
+                    }
                 },
-            ).map_err(|error| format!("route {:?}: {error}", route.route))?;
+            )
+            .map_err(|error| format!("route {:?}: {error}", route.route))?;
     }
+
     for handler in channel_handlers {
         let callback = handler.callback;
-        let route_name = handler.route.clone();
         let user_data = handler.user_data;
-        router.register_channel_handler(
-            handler.route.clone(),
-            move |request: Request, conn_id: u32| {
-                let route_name = route_name.clone();
-                async move {
-                    let options: Vec<MMA_Option> = request
-                        .options
-                        .iter()
-                        .map(|(key, value)| MMA_Option {
-                            key: key.as_ptr(),
-                            key_len: key.len(),
-                            value: value.as_ptr(),
-                            value_len: value.len(),
-                        })
-                        .collect();
-                    let request_view = MMA_Request {
-                        route: route_name.as_ptr(),
-                        route_len: route_name.len(),
-                        opcode: request.headers.opcode as u8,
-                        version: request.headers.version,
-                        request_id: request.headers.req_id,
-                        payload: request.payload.as_ptr(),
-                        payload_len: request.payload.len(),
-                        options: if options.is_empty() {
-                            ptr::null()
-                        } else {
-                            options.as_ptr()
-                        },
-                        options_count: options.len(),
-                    };
-                    let status = callback(&request_view, conn_id, user_data as *mut c_void);
-                    if status != MMA_OK {
-                        eprintln!(
-                            "MMA channel handler {route_name} callback returned status {status}"
-                        );
+        let callback_semaphore = Arc::clone(&c_callback_semaphore);
+
+        router
+            .register_channel_handler(
+                handler.route.clone(),
+                move |request: Request, conn_id: u32| {
+                    let callback_semaphore = Arc::clone(&callback_semaphore);
+                    async move {
+                        run_c_channel_callback(
+                            callback,
+                            request,
+                            conn_id,
+                            user_data,
+                            callback_semaphore,
+                            "channel handler",
+                        )
+                        .await;
                     }
+                },
+            )
+            .map_err(|error| format!("channel route {:?}: {error}", handler.route))?;
+    }
+
+    if let Some(handler) = on_channel_connect_handler {
+        let callback = handler.callback;
+        let user_data = handler.user_data;
+        let callback_semaphore = Arc::clone(&c_callback_semaphore);
+
+        router.register_on_channel_connect_handler(
+            move |request: Request, conn_id: u32| {
+                let callback_semaphore = Arc::clone(&callback_semaphore);
+                async move {
+                    run_c_channel_callback(
+                        callback,
+                        request,
+                        conn_id,
+                        user_data,
+                        callback_semaphore,
+                        "on_channel_connect",
+                    )
+                    .await;
                 }
             },
-        ).map_err(|error| format!("channel route {:?}: {error}", handler.route))?;
+        );
     }
+
+    if let Some(handler) = on_channel_disconnect_handler {
+        let callback = handler.callback;
+        let user_data = handler.user_data;
+        let callback_semaphore = Arc::clone(&c_callback_semaphore);
+
+        router.register_on_channel_disconnect_handler(
+            move |request: Request, conn_id: u32| {
+                let callback_semaphore = Arc::clone(&callback_semaphore);
+                async move {
+                    run_c_channel_callback(
+                        callback,
+                        request,
+                        conn_id,
+                        user_data,
+                        callback_semaphore,
+                        "on_channel_disconnect",
+                    )
+                    .await;
+                }
+            },
+        );
+    }
+
     Ok(router)
 }
 
@@ -306,6 +503,9 @@ unsafe fn response_mut<'a>(response: MMA_Response) -> Result<&'a mut Response, i
     if response.response.is_null() {
         return Err(MMA_INVALID_ARGUMENT);
     }
+
+    // SAFETY: the caller of the exported mutator must pass a live response
+    // handle created by this library and must ensure exclusive access.
     Ok(unsafe { &mut *response.response })
 }
 
@@ -316,10 +516,13 @@ fn response_error() -> MMA_Response {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mma_server_config_default(output: *mut MMA_ServerConfig) -> i32 {
+pub unsafe extern "C" fn mma_server_config_default(
+    output: *mut MMA_ServerConfig,
+) -> i32 {
     if output.is_null() {
         return MMA_INVALID_ARGUMENT;
     }
+
     let framer = FramerConfig::default();
     let config = MMA_ServerConfig {
         bind_ip: c"0.0.0.0".as_ptr(),
@@ -332,9 +535,9 @@ pub unsafe extern "C" fn mma_server_config_default(output: *mut MMA_ServerConfig
         shutdown_grace_ms: 10_000,
         request_timeout_ms: 10_000,
     };
-    unsafe {
-        *output = config;
-    }
+
+    // SAFETY: output was checked for null; caller must provide writable storage.
+    unsafe { *output = config };
     MMA_OK
 }
 
@@ -346,20 +549,26 @@ pub unsafe extern "C" fn mma_server_create(
     if output.is_null() {
         return MMA_INVALID_ARGUMENT;
     }
-    unsafe {
-        *output = ptr::null_mut();
-    }
+
+    // SAFETY: output was checked for null and must be writable by the caller.
+    unsafe { *output = ptr::null_mut() };
+
     if config.is_null() {
         return MMA_INVALID_ARGUMENT;
     }
+
+    // SAFETY: config must point to a valid, initialized MMA_ServerConfig.
     let config = unsafe { *config };
     if config.bind_ip.is_null() {
         return MMA_INVALID_ARGUMENT;
     }
+
+    // SAFETY: bind_ip must be a valid NUL-terminated string.
     let bind_ip = match unsafe { CStr::from_ptr(config.bind_ip) }.to_str() {
         Ok(value) => value,
         Err(_) => return MMA_INVALID_ARGUMENT,
     };
+
     let ip = match bind_ip.parse::<IpAddr>() {
         Ok(value) => value,
         Err(_) => return MMA_INVALID_ARGUMENT,
@@ -369,7 +578,9 @@ pub unsafe extern "C" fn mma_server_create(
         return MMA_INVALID_CONFIG;
     };
 
-    if rust_config.frame_config.validate().is_err() || rust_config.validate().is_err() {
+    if rust_config.frame_config.validate().is_err()
+        || rust_config.validate().is_err()
+    {
         return MMA_INVALID_CONFIG;
     }
 
@@ -379,14 +590,16 @@ pub unsafe extern "C" fn mma_server_create(
         bound_port: address.port(),
         routes: Vec::new(),
         channel_handlers: Vec::new(),
+        on_channel_connect_handler: None,
+        on_channel_disconnect_handler: None,
         started: false,
         stop: CancellationToken::new(),
         thread: None,
-        handle: None
+        handle: None,
     };
-    unsafe {
-        *output = Box::into_raw(Box::new(server));
-    }
+
+    // SAFETY: output is writable and receives ownership of the boxed server.
+    unsafe { *output = Box::into_raw(Box::new(server)) };
     MMA_OK
 }
 
@@ -401,25 +614,33 @@ pub unsafe extern "C" fn mma_server_register_route(
     if server.is_null() || !valid_slice(route, route_len) {
         return MMA_INVALID_ARGUMENT;
     }
+
+    // SAFETY: server must be a live handle exclusively accessible during registration.
     let server = unsafe { &mut *server };
     if server.started {
         return MMA_SERVER_ALREADY_STARTED;
     }
+
     if route_len == 0 || route_len > u8::MAX as usize {
         return MMA_INVALID_ARGUMENT;
     }
+
+    // SAFETY: route/route_len were validated; caller supplies readable bytes.
     let route = match std::str::from_utf8(unsafe { raw_slice(route, route_len) }) {
         Ok(value) => value,
         Err(_) => return MMA_INVALID_ARGUMENT,
     };
+
     let Some(callback) = callback else {
         return MMA_INVALID_ARGUMENT;
     };
+
     server.routes.push(RegisteredRoute {
         route: route.to_owned(),
         callback,
         user_data: user_data as usize,
     });
+
     MMA_OK
 }
 
@@ -434,6 +655,8 @@ pub unsafe extern "C" fn mma_server_register_channel_handler(
     if server.is_null() || !valid_slice(route, route_len) {
         return MMA_INVALID_ARGUMENT;
     }
+
+    // SAFETY: server must be a live handle exclusively accessible during registration.
     let server = unsafe { &mut *server };
     if server.started || route_len == 0 || route_len > u8::MAX as usize {
         return if server.started {
@@ -442,18 +665,84 @@ pub unsafe extern "C" fn mma_server_register_channel_handler(
             MMA_INVALID_ARGUMENT
         };
     }
+
+    // SAFETY: route/route_len were validated; caller supplies readable bytes.
     let route = match std::str::from_utf8(unsafe { raw_slice(route, route_len) }) {
         Ok(value) => value,
         Err(_) => return MMA_INVALID_ARGUMENT,
     };
+
     let Some(callback) = callback else {
         return MMA_INVALID_ARGUMENT;
     };
+
     server.channel_handlers.push(RegisteredChannelHandler {
         route: route.to_owned(),
         callback,
         user_data: user_data as usize,
     });
+
+    MMA_OK
+}
+
+
+/// Registers the global callback invoked by Router::on_channel_connect.
+/// Calling this again before server start replaces the previous callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mma_server_register_on_channel_connect_handler(
+    server: *mut MMA_Server,
+    callback: MMA_ChannelHandlerCallback,
+    user_data: *const c_void,
+) -> i32 {
+    if server.is_null() {
+        return MMA_INVALID_ARGUMENT;
+    }
+
+    // SAFETY: server must be a live handle exclusively accessible during registration.
+    let server = unsafe { &mut *server };
+    if server.started {
+        return MMA_SERVER_ALREADY_STARTED;
+    }
+
+    let Some(callback) = callback else {
+        return MMA_INVALID_ARGUMENT;
+    };
+
+    server.on_channel_connect_handler = Some(RegisteredLifecycleHandler {
+        callback,
+        user_data: user_data as usize,
+    });
+
+    MMA_OK
+}
+
+/// Registers the global callback invoked by Router::on_channel_disconnect.
+/// Calling this again before server start replaces the previous callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mma_server_register_on_channel_disconnect_handler(
+    server: *mut MMA_Server,
+    callback: MMA_ChannelHandlerCallback,
+    user_data: *const c_void,
+) -> i32 {
+    if server.is_null() {
+        return MMA_INVALID_ARGUMENT;
+    }
+
+    // SAFETY: server must be a live handle exclusively accessible during registration.
+    let server = unsafe { &mut *server };
+    if server.started {
+        return MMA_SERVER_ALREADY_STARTED;
+    }
+
+    let Some(callback) = callback else {
+        return MMA_INVALID_ARGUMENT;
+    };
+
+    server.on_channel_disconnect_handler = Some(RegisteredLifecycleHandler {
+        callback,
+        user_data: user_data as usize,
+    });
+
     MMA_OK
 }
 
@@ -465,17 +754,17 @@ pub unsafe extern "C" fn mma_server_route(
     callback: MMA_RouteCallback,
     user_data: *mut c_void,
 ) -> i32 {
+    // SAFETY: forwards the same argument contract to the canonical function.
     unsafe { mma_server_register_route(server, route, route_len, callback, user_data) }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mma_server_start(
-    server: *mut MMA_Server,
-) -> i32 {
+pub unsafe extern "C" fn mma_server_start(server: *mut MMA_Server) -> i32 {
     if server.is_null() {
         return MMA_INVALID_ARGUMENT;
     }
 
+    // SAFETY: server must be a live handle exclusively accessible during start.
     let server = unsafe { &mut *server };
 
     if server.started {
@@ -483,18 +772,28 @@ pub unsafe extern "C" fn mma_server_start(
     }
 
     let config = server.config.clone();
+
+    // Bound the number of C callbacks running simultaneously. This semaphore is
+    // shared by both route and channel callbacks and does not change the ABI.
+    let c_callback_limit = (config.max_in_flight.max(1) as usize)
+        .min(MMA_MAX_CONCURRENT_C_CALLBACKS);
+    let c_callback_semaphore = Arc::new(Semaphore::new(c_callback_limit));
+
     let router = match router_from_registrations(
         &server.routes,
         &server.channel_handlers,
+        server.on_channel_connect_handler.as_ref(),
+        server.on_channel_disconnect_handler.as_ref(),
+        c_callback_semaphore,
     ) {
-        Ok(r) => r,
-        Err(_) => {
+        Ok(router) => router,
+        Err(error) => {
+            eprintln!("MMA router initialization failed: {error}");
             return MMA_SERVER_ERROR;
         }
     };
 
     let stop = server.stop.clone();
-
     let (ready_tx, ready_rx) =
         mpsc::sync_channel::<Result<(SocketAddr, ServerHandle), String>>(1);
 
@@ -503,6 +802,7 @@ pub unsafe extern "C" fn mma_server_start(
         .spawn(move || {
             let runtime = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
+                .max_blocking_threads(c_callback_limit)
                 .build()
             {
                 Ok(runtime) => runtime,
@@ -515,16 +815,13 @@ pub unsafe extern "C" fn mma_server_start(
             };
 
             runtime.block_on(async move {
-                let listener =
-                    match tokio::net::TcpListener::bind(config.address).await {
-                        Ok(listener) => listener,
-                        Err(error) => {
-                            let _ = ready_tx.send(Err(format!(
-                                "TCP bind failed: {error}"
-                            )));
-                            return;
-                        }
-                    };
+                let listener = match tokio::net::TcpListener::bind(config.address).await {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(format!("TCP bind failed: {error}")));
+                        return;
+                    }
+                };
 
                 let local_addr = match listener.local_addr() {
                     Ok(addr) => addr,
@@ -536,10 +833,7 @@ pub unsafe extern "C" fn mma_server_start(
                     }
                 };
 
-                let mut running_server = match Server::from_listener(
-                    config,
-                    listener,
-                ) {
+                let mut running_server = match Server::from_listener(config, listener) {
                     Ok(server) => server,
                     Err(error) => {
                         let _ = ready_tx.send(Err(format!(
@@ -550,7 +844,6 @@ pub unsafe extern "C" fn mma_server_start(
                 };
 
                 let handle = running_server.handle();
-
                 if ready_tx.send(Ok((local_addr, handle))).is_err() {
                     return;
                 }
@@ -562,6 +855,11 @@ pub unsafe extern "C" fn mma_server_start(
                     eprintln!("MMA server stopped after an error: {error}");
                 }
             });
+
+            // Dropping runtime waits for already-started spawn_blocking jobs.
+            // Therefore mma_server_stop may wait past shutdown_grace_ms if a C
+            // callback is still executing. A synchronous C function cannot be
+            // forcibly interrupted while preserving this ABI.
         })
     {
         Ok(thread) => thread,
@@ -577,16 +875,13 @@ pub unsafe extern "C" fn mma_server_start(
             server.handle = Some(handle);
             server.thread = Some(thread);
             server.started = true;
-
             MMA_OK
         }
-
         Ok(Err(error)) => {
             eprintln!("MMA server startup failed: {error}");
             let _ = thread.join();
             MMA_SERVER_ERROR
         }
-
         Err(error) => {
             eprintln!("MMA server startup handshake failed: {error}");
             let _ = thread.join();
@@ -595,7 +890,7 @@ pub unsafe extern "C" fn mma_server_start(
     }
 }
 
-/// Создаёт независимый C handle из запущенного сервера.
+/// Creates an independent C handle from a running server.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mma_server_get_handle(
     server: *const MMA_Server,
@@ -605,10 +900,10 @@ pub unsafe extern "C" fn mma_server_get_handle(
         return MMA_INVALID_ARGUMENT;
     }
 
-    unsafe {
-        *output = ptr::null_mut();
-    }
+    // SAFETY: output must be writable by the caller.
+    unsafe { *output = ptr::null_mut() };
 
+    // SAFETY: server must point to a live MMA_Server.
     let server = unsafe { &*server };
 
     if !server.started {
@@ -631,21 +926,16 @@ pub unsafe extern "C" fn mma_server_get_handle(
         inner: handle.clone(),
     });
 
-    unsafe {
-        *output = Box::into_raw(handle);
-    }
-
+    // SAFETY: output is writable and receives ownership of the boxed handle.
+    unsafe { *output = Box::into_raw(handle) };
     MMA_OK
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mma_server_handle_destroy(
-    handle: *mut MMA_ServerHandle,
-) {
+pub unsafe extern "C" fn mma_server_handle_destroy(handle: *mut MMA_ServerHandle) {
     if !handle.is_null() {
-        unsafe {
-            drop(Box::from_raw(handle));
-        }
+        // SAFETY: handle must be a live, uniquely-owned pointer from get_handle.
+        unsafe { drop(Box::from_raw(handle)) };
     }
 }
 
@@ -659,6 +949,7 @@ pub unsafe extern "C" fn mma_server_handle_send_to_channel(
         return MMA_INVALID_ARGUMENT;
     }
 
+    // SAFETY: both pointers must reference live objects for this call.
     let handle = unsafe { &*handle };
     let message = unsafe { (&*message.response).clone() };
 
@@ -677,6 +968,7 @@ pub unsafe extern "C" fn mma_server_handle_change_config(
         return MMA_INVALID_ARGUMENT;
     }
 
+    // SAFETY: pointers must reference live objects for this call.
     let handle = unsafe { &*handle };
     let config = unsafe { &*config };
 
@@ -688,9 +980,7 @@ pub unsafe extern "C" fn mma_server_handle_change_config(
         return MMA_INVALID_CONFIG;
     };
 
-    if config.frame_config.validate().is_err()
-        || config.validate().is_err()
-    {
+    if config.frame_config.validate().is_err() || config.validate().is_err() {
         return MMA_INVALID_CONFIG;
     }
 
@@ -704,36 +994,45 @@ pub unsafe extern "C" fn mma_server_handle_change_config(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mma_server_local_port(server: *const MMA_Server, port: *mut u16) -> i32 {
+pub unsafe extern "C" fn mma_server_local_port(
+    server: *const MMA_Server,
+    port: *mut u16,
+) -> i32 {
     if server.is_null() || port.is_null() {
         return MMA_INVALID_ARGUMENT;
     }
-    unsafe {
-        *port = (*server).bound_port;
-    }
+
+    // SAFETY: server is live and port points to writable u16 storage.
+    unsafe { *port = (*server).bound_port };
     MMA_OK
 }
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mma_server_stop(server: *mut MMA_Server) -> i32 {
     if server.is_null() {
         return MMA_INVALID_ARGUMENT;
     }
+
+    // SAFETY: server must be a live handle exclusively accessible during stop.
     let server = unsafe { &mut *server };
     let Some(thread) = server.thread.take() else {
         return MMA_OK;
     };
+
     server.stop.cancel();
     if thread.join().is_err() {
         return MMA_SERVER_ERROR;
     }
+
     MMA_OK
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mma_server_destroy(server: *mut MMA_Server) {
     if !server.is_null() {
+        // SAFETY: forwards the live pointer to stop, then reclaims its allocation.
         let _ = unsafe { mma_server_stop(server) };
-        drop(unsafe { Box::from_raw(server) });
+        unsafe { drop(Box::from_raw(server)) };
     }
 }
 
@@ -745,13 +1044,10 @@ pub extern "C" fn mma_response_new(request_id: u32) -> MMA_Response {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mma_response_destroy(
-    response: MMA_Response,
-) {
+pub unsafe extern "C" fn mma_response_destroy(response: MMA_Response) {
     if !response.response.is_null() {
-        unsafe {
-            drop(Box::from_raw(response.response));
-        }
+        // SAFETY: response must be a live, uniquely-owned response handle.
+        unsafe { drop(Box::from_raw(response.response)) };
     }
 }
 
@@ -763,12 +1059,13 @@ pub unsafe extern "C" fn mma_response_set_status(
     let Some(opcode) = ResponseOpcode::from_number(opcode) else {
         return response_error();
     };
+
     let response_ptr = response.response;
     let response = match unsafe { response_mut(response) } {
         Ok(response) => response,
         Err(_) => return response_error(),
     };
-    
+
     response.headers.opcode = opcode;
     MMA_Response {
         response: response_ptr,
@@ -784,12 +1081,15 @@ pub unsafe extern "C" fn mma_response_set_payload(
     if !valid_slice(data, data_len) {
         return response_error();
     }
+
     let response_ptr = response.response;
     let response = match unsafe { response_mut(response) } {
         Ok(response) => response,
         Err(_) => return response_error(),
     };
-    response.payload = bytes::Bytes::copy_from_slice(unsafe { raw_slice(data, data_len) });
+
+    // SAFETY: data/data_len were validated; caller provides readable bytes.
+    response.payload = Bytes::copy_from_slice(unsafe { raw_slice(data, data_len) });
     MMA_Response {
         response: response_ptr,
     }
@@ -812,19 +1112,26 @@ pub unsafe extern "C" fn mma_response_add_option(
     {
         return response_error();
     }
-    let key = unsafe { raw_slice(key, key_len)};
+
+    // SAFETY: key/value slices were validated and are copied into owned Bytes.
+    let key = unsafe { raw_slice(key, key_len) };
     let value = unsafe { raw_slice(value, value_len) };
+
     let response_ptr = response.response;
     let response = match unsafe { response_mut(response) } {
         Ok(response) => response,
         Err(_) => return response_error(),
     };
+
     if response.options.len() >= u8::MAX as usize {
         return response_error();
     }
-    response
-        .options
-        .push((Bytes::from(key), Bytes::from(value)));
+
+    response.options.push((
+        Bytes::copy_from_slice(key),
+        Bytes::copy_from_slice(value),
+    ));
+
     MMA_Response {
         response: response_ptr,
     }
@@ -841,6 +1148,7 @@ mod tests {
             unsafe { mma_server_config_default(config.as_mut_ptr()) },
             MMA_OK
         );
+
         let config = unsafe { config.assume_init() };
         assert_eq!(config.port, 8080);
         assert_eq!(config.max_connections, 128_000);
@@ -862,10 +1170,12 @@ mod tests {
             unsafe { mma_server_config_default(config.as_mut_ptr()) },
             MMA_OK
         );
+
         let mut config = unsafe { config.assume_init() };
         config.drain_timeout_ms = 125;
         config.shutdown_grace_ms = 4_500;
         config.request_timeout_ms = 0;
+
         let rust_config = config_from_c(&config).expect("default bind address is valid");
         assert_eq!(rust_config.drain_timeout, Duration::from_millis(125));
         assert_eq!(rust_config.shutdown_grace, Duration::from_millis(4_500));
@@ -878,11 +1188,13 @@ mod tests {
             unsafe { mma_server_config_default(ptr::null_mut()) },
             MMA_INVALID_ARGUMENT
         );
+
         let mut server = ptr::null_mut();
         assert_eq!(
             unsafe { mma_server_create(ptr::null(), &mut server) },
             MMA_INVALID_ARGUMENT
         );
+
         assert_eq!(
             unsafe { mma_server_stop(ptr::null_mut()) },
             MMA_INVALID_ARGUMENT
