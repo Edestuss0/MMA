@@ -86,22 +86,22 @@ pub struct FramerConfig {
     pub options_count_pos: u8,
     pub options_key_first: bool,
     pub header_length: u8,
-    pub big_bytes_config: BigBytesConfig
+    pub big_bytes_config: BigBytesConfig,
 }
 
 #[derive(Debug, Clone)]
 pub struct BigBytesConfig {
     pub payload_len_order: u8,
     pub options_len_order: u8,
-    pub req_id_order: u8
+    pub req_id_order: u8,
 }
 
 impl BigBytesConfig {
     pub fn new() -> Self {
-        Self{
+        Self {
             options_len_order: 1,
             payload_len_order: 2,
-            req_id_order: 3
+            req_id_order: 3,
         }
     }
 
@@ -109,19 +109,17 @@ impl BigBytesConfig {
         let poses: [u8; 3] = [
             self.options_len_order,
             self.payload_len_order,
-            self.req_id_order
+            self.req_id_order,
         ];
         if poses.contains(&0) {
             return Err(());
         }
         for item in poses {
-            if poses.iter().filter(|&&x| x == item).count() > 1
-                || item > (3)
-            {
+            if poses.iter().filter(|&&x| x == item).count() > 1 || item > (3) {
                 return Err(());
             }
         }
-        
+
         Ok(())
     }
 }
@@ -179,7 +177,7 @@ impl Default for FramerConfig {
             payload_order: 3,
             options_key_first: true,
             header_length: MIN_HEADER_LEN + RESERVED_SUFFIX,
-            big_bytes_config: BigBytesConfig::new()
+            big_bytes_config: BigBytesConfig::new(),
         }
     }
 }

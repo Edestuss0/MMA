@@ -1,63 +1,133 @@
-
-name: Build and publish MMA native libraries
+name: CI and native release
 
 on:
   push:
+    branches:
+      - "**"
     tags:
-      - 'v*'
+      - "v*"
+  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: mma-release-${{ github.ref }}
-  cancel-in-progress: false
+  group: mma-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
+  test:
+    name: Test Rust and C API
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Rust tests
+        run: cargo test --locked --all-targets
+        env:
+          CARGO_TERM_COLOR: always
+          RUST_BACKTRACE: 1
+
+      - name: Build release libraries
+        run: cargo build --locked --release
+        env:
+          CARGO_TERM_COLOR: always
+
+      - name: Compile C example against the public API
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cc \
+            -std=c11 \
+            -D_POSIX_C_SOURCE=200809L \
+            -Wall -Wextra -Werror \
+            -I include \
+            examples/main_server.c \
+            -L target/release \
+            -Wl,-rpath,"$PWD/target/release" \
+            -lMMA \
+            -pthread \
+            -o target/main_server_c
+
+          test -x target/main_server_c
+
+      - name: Check C++ header compatibility
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > "$RUNNER_TEMP/mma_header_smoke.cpp" <<'CPP'
+          #include "mma.h"
+
+          int main() {
+              MMA_ServerConfig config{};
+              MMA_Request request{};
+              MMA_Response response{};
+              (void)config;
+              (void)request;
+              (void)response;
+              return MMA_OK;
+          }
+          CPP
+
+          c++ \
+            -std=c++17 \
+            -Wall -Wextra -Werror \
+            -I include \
+            -fsyntax-only \
+            "$RUNNER_TEMP/mma_header_smoke.cpp"
+
   build-native:
-    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    name: Build ${{ matrix.os_name }} / ${{ matrix.arch_name }}
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ${{ matrix.runner }}
 
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Windows x64
           - runner: windows-2025
             target: x86_64-pc-windows-msvc
-            goos: windows
-            goarch: amd64
+            os_name: windows
+            arch_name: amd64
             library: MMA.dll
+            import_library: MMA.dll.lib
             asset: mma-native-windows-amd64.zip
             static_crt: true
 
-          # Linux x64
-          - runner: ubuntu-22.04
+          - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            goos: linux
-            goarch: amd64
+            os_name: linux
+            arch_name: amd64
             library: libMMA.so
             asset: mma-native-linux-amd64.zip
             static_crt: false
 
-          # macOS Intel
           - runner: macos-15-intel
             target: x86_64-apple-darwin
-            goos: darwin
-            goarch: amd64
+            os_name: darwin
+            arch_name: amd64
             library: libMMA.dylib
             asset: mma-native-darwin-amd64.zip
             static_crt: false
 
-          # macOS Apple Silicon
           - runner: macos-15
             target: aarch64-apple-darwin
-            goos: darwin
-            goarch: arm64
+            os_name: darwin
+            arch_name: arm64
             library: libMMA.dylib
             asset: mma-native-darwin-arm64.zip
             static_crt: false
-
-    runs-on: ${{ matrix.runner }}
 
     env:
       CARGO_TERM_COLOR: always
@@ -65,496 +135,162 @@ jobs:
       RUSTFLAGS: ${{ matrix.static_crt && '-C target-feature=+crt-static' || '' }}
 
     steps:
-      # ================================================
-      # Checkout
-      # ================================================
-
       - name: Checkout repository
         uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 
-      # ================================================
-      # MSVC environment
-      # ================================================
-
-      - name: Setup MSVC environment
+      - name: Configure MSVC environment
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      # ================================================
-      # Fix Windows linker priority
-      # ================================================
-
-      - name: Select MSVC linker
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $candidates = @(where.exe link.exe 2>$null)
-
-          $msvcLinker = $candidates |
-              Where-Object {
-                  $_ -match '(?i)\\VC\\Tools\\MSVC\\.*\\link\.exe$'
-              } |
-              Select-Object -First 1
-
-          if (!$msvcLinker) {
-              Write-Host "Found linker candidates:"
-              $candidates | ForEach-Object {
-                  Write-Host $_
-              }
-
-              throw "MSVC link.exe was not found"
-          }
-
-          $linkerDir = Split-Path -Parent $msvcLinker
-
-          # Put MSVC linker before Git usr/bin
-          $env:PATH = "$linkerDir;$env:PATH"
-
-          # Preserve PATH priority in subsequent steps
-          Add-Content -Path $env:GITHUB_PATH -Value $linkerDir
-
-          $selectedLinker = (Get-Command link.exe -ErrorAction Stop).Path
-
-          Write-Host "Selected linker: $selectedLinker"
-
-          if ($selectedLinker -ine $msvcLinker) {
-              throw "Wrong linker selected: $selectedLinker"
-          }
-
-      # ================================================
-      # Rust toolchain
-      # ================================================
-
-      - name: Install Rust toolchain
+      - name: Install Rust stable and target
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      # ================================================
-      # Build Rust cdylib - Windows
-      # ================================================
+      - name: Build native library
+        run: cargo build --locked --release --target "${{ matrix.target }}"
 
-      - name: Build Rust cdylib (Windows)
+      - name: Package native library (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-
-          cargo build `
-              --locked `
-              --release `
-              --target "${{ matrix.target }}"
-
-          if ($LASTEXITCODE -ne 0) {
-              exit $LASTEXITCODE
-          }
+          $ErrorActionPreference = 'Stop'
 
           $releaseDir = "target/${{ matrix.target }}/release"
-
           $library = Join-Path $releaseDir "${{ matrix.library }}"
-          $importLibrary = Join-Path $releaseDir "MMA.dll.lib"
+          $importLibrary = Join-Path $releaseDir "${{ matrix.import_library }}"
 
-          if (!(Test-Path $library)) {
-              throw "Rust library not found: $library"
+          if (!(Test-Path -LiteralPath $library -PathType Leaf)) {
+              throw "Native library was not produced: $library"
+          }
+          if (!(Test-Path -LiteralPath $importLibrary -PathType Leaf)) {
+              throw "MSVC import library was not produced: $importLibrary"
           }
 
-          if (!(Test-Path $importLibrary)) {
-              throw "Import library not found: $importLibrary"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $stage = Join-Path $env:RUNNER_TEMP 'mma-native-package'
+          if (Test-Path -LiteralPath $stage) {
+              Remove-Item -LiteralPath $stage -Recurse -Force
           }
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
-          Write-Host "Rust library successfully built"
+          Copy-Item -LiteralPath $library -Destination $stage
+          Copy-Item -LiteralPath $importLibrary -Destination $stage
+          Copy-Item -LiteralPath 'include/mma.h' -Destination $stage
 
-      # ================================================
-      # Build Rust cdylib - Unix
-      # ================================================
+          $archive = Join-Path $PWD 'dist/${{ matrix.asset }}'
+          Compress-Archive -Path (Join-Path $stage '*') `
+              -DestinationPath $archive -CompressionLevel Optimal -Force
 
-      - name: Build Rust cdylib (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
+          $digest = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          $assetName = [System.IO.Path]::GetFileName($archive)
+          "$digest  $assetName" | Set-Content -LiteralPath "$archive.sha256" -Encoding ascii
 
-          cargo build \
-            --locked \
-            --release \
-            --target "${{ matrix.target }}"
-
-          release_dir="target/${{ matrix.target }}/release"
-          library="$release_dir/${{ matrix.library }}"
-
-          test -f "$library"
-
-          ls -lh "$library"
-
-      # ================================================
-      # Configure macOS install name
-      # ================================================
+          Write-Host "Created $archive"
 
       - name: Configure macOS dylib install name
         if: runner.os == 'macOS'
         shell: bash
         run: |
           set -euo pipefail
-
-          release_dir="target/${{ matrix.target }}/release"
-          library="$release_dir/${{ matrix.library }}"
-
-          install_name_tool \
-            -id '@rpath/libMMA.dylib' \
-            "$library"
-
-          echo "MMA install name:"
+          library="target/${{ matrix.target }}/release/${{ matrix.library }}"
+          install_name_tool -id '@rpath/libMMA.dylib' "$library"
           otool -D "$library"
 
-      # ================================================
-      # Build C callback bridge - Windows
-      # ================================================
-
-      - name: Build callback bridge (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $releaseDir = "target/${{ matrix.target }}/release"
-
-          $library = Join-Path $releaseDir "${{ matrix.library }}"
-          $importLibrary = Join-Path $releaseDir "MMA.dll.lib"
-
-          $bridge = Join-Path $releaseDir "mma_go_bridge.dll"
-          $objectFile = Join-Path $releaseDir "mma_go_bridge.obj"
-
-          if (!(Test-Path $library)) {
-              throw "MMA.dll not found"
-          }
-
-          if (!(Test-Path $importLibrary)) {
-              throw "MMA.dll.lib not found"
-          }
-
-          $cl = (Get-Command cl.exe -ErrorAction Stop).Path
-
-          Write-Host "Using compiler: $cl"
-
-          & $cl `
-              /nologo `
-              /O2 `
-              /MT `
-              /LD `
-              /I include `
-              "/Fo:$objectFile" `
-              native-bridge\bridge.c `
-              /link `
-              "/LIBPATH:$releaseDir" `
-              "$importLibrary" `
-              "/OUT:$bridge"
-
-          if ($LASTEXITCODE -ne 0) {
-              throw "C callback bridge compilation failed"
-          }
-
-          if (!(Test-Path $bridge)) {
-              throw "Callback bridge was not generated"
-          }
-
-          Write-Host "Callback bridge successfully built"
-
-      # ================================================
-      # Build C callback bridge - Linux
-      # ================================================
-
-      - name: Build callback bridge (Linux)
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          release_dir="target/${{ matrix.target }}/release"
-          bridge="$release_dir/libmma_go_bridge.so"
-
-          cc \
-            -O2 \
-            -fPIC \
-            -shared \
-            -I include \
-            native-bridge/bridge.c \
-            -L "$release_dir" \
-            -lMMA \
-            -Wl,-rpath,'$ORIGIN' \
-            -o "$bridge"
-
-          test -f "$bridge"
-
-          echo "Checking bridge dependencies:"
-
-          ldd_output="$(ldd "$bridge")"
-
-          printf '%s\n' "$ldd_output"
-
-          if grep -Fq "not found" <<< "$ldd_output"; then
-              echo "Unresolved shared library dependency"
-              exit 1
-          fi
-
-      # ================================================
-      # Build C callback bridge - macOS
-      # ================================================
-
-      - name: Build callback bridge (macOS)
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          release_dir="target/${{ matrix.target }}/release"
-          bridge="$release_dir/libmma_go_bridge.dylib"
-
-          clang \
-            -O2 \
-            -fPIC \
-            -dynamiclib \
-            -I include \
-            native-bridge/bridge.c \
-            -L "$release_dir" \
-            -lMMA \
-            -Wl,-rpath,@loader_path \
-            -o "$bridge"
-
-          test -f "$bridge"
-
-          echo "Checking bridge dependencies:"
-
-          otool_output="$(otool -L "$bridge")"
-
-          printf '%s\n' "$otool_output"
-
-          if ! grep -Fq '@rpath/libMMA.dylib' <<< "$otool_output"; then
-              echo "MMA dylib dependency was not linked correctly"
-              exit 1
-          fi
-
-      # ================================================
-      # Package Windows libraries
-      # ================================================
-
-      - name: Package native libraries (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $releaseDir = "target/${{ matrix.target }}/release"
-
-          $library = Join-Path $releaseDir "${{ matrix.library }}"
-          $bridge = Join-Path $releaseDir "mma_go_bridge.dll"
-
-          if (!(Test-Path $library)) {
-              throw "Native library not found"
-          }
-
-          if (!(Test-Path $bridge)) {
-              throw "Callback bridge not found"
-          }
-
-          New-Item -ItemType Directory -Force dist | Out-Null
-
-          $stage = Join-Path $env:RUNNER_TEMP "mma-native-package"
-
-          if (Test-Path $stage) {
-              Remove-Item -Recurse -Force $stage
-          }
-
-          New-Item -ItemType Directory -Force $stage | Out-Null
-
-          Copy-Item -LiteralPath $library -Destination $stage
-          Copy-Item -LiteralPath $bridge -Destination $stage
-
-          $archive = Join-Path $PWD "dist/${{ matrix.asset }}"
-
-          Push-Location $stage
-
-          try {
-              Compress-Archive `
-                  -Path "${{ matrix.library }}", "mma_go_bridge.dll" `
-                  -DestinationPath $archive `
-                  -CompressionLevel Optimal
-          }
-          finally {
-              Pop-Location
-          }
-
-          $digest = (
-              Get-FileHash -LiteralPath $archive -Algorithm SHA256
-          ).Hash.ToLowerInvariant()
-
-          $fileName = [System.IO.Path]::GetFileName($archive)
-
-          "$digest  $fileName" |
-              Set-Content -LiteralPath "$archive.sha256" -Encoding ascii
-
-          Write-Host "Created $archive"
-
-      # ================================================
-      # Package Linux and macOS libraries
-      # ================================================
-
-      - name: Package native libraries (Unix)
+      - name: Package native library (Unix)
         if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
 
           release_dir="target/${{ matrix.target }}/release"
-
           library="$release_dir/${{ matrix.library }}"
 
-          case "${{ matrix.goos }}" in
-            linux)
-              bridge="$release_dir/libmma_go_bridge.so"
-              ;;
-            darwin)
-              bridge="$release_dir/libmma_go_bridge.dylib"
-              ;;
-            *)
-              echo "Unsupported operating system"
-              exit 1
-              ;;
-          esac
-
-          test -f "$library" || {
-              echo "Native library not found"
-              exit 1
-          }
-
-          test -f "$bridge" || {
-              echo "Callback bridge not found"
-              exit 1
-          }
+          if [[ ! -f "$library" ]]; then
+            echo "Native library was not produced: $library" >&2
+            exit 1
+          fi
 
           mkdir -p dist
-
-          asset="${{ matrix.asset }}"
-          archive="dist/$asset"
-
-          zip -j "$archive" "$library" "$bridge"
+          archive="dist/${{ matrix.asset }}"
+          zip -j "$archive" "$library" include/mma.h
 
           (
             cd dist
-
-            if command -v sha256sum >/dev/null 2>&1; then
-              sha256sum "$asset" > "$asset.sha256"
-            else
-              shasum -a 256 "$asset" > "$asset.sha256"
-            fi
+            shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
           )
-
-          echo "Created $archive"
 
           ls -lh "$archive" "$archive.sha256"
 
-      # ================================================
-      # Upload artifacts
-      # ================================================
 
-      - name: Upload native artifacts
+      - name: Upload native package
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: native-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/*
+          name: native-${{ matrix.os_name }}-${{ matrix.arch_name }}
+          path: |
+            dist/${{ matrix.asset }}
+            dist/${{ matrix.asset }}.sha256
           if-no-files-found: error
           retention-days: 7
 
-  # ====================================================
-  # Publish GitHub Release
-  # ====================================================
-
   publish-release:
     name: Publish GitHub Release
-
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: build-native
-
     runs-on: ubuntu-24.04
-
     permissions:
       contents: write
 
     steps:
-      # ================================================
-      # Download all platform artifacts
-      # ================================================
-
-      - name: Download native artifacts
+      - name: Download native packages
         uses: actions/download-artifact@v8.0.2
         with:
           pattern: native-*
           path: dist
           merge-multiple: true
 
-      # ================================================
-      # Verify all release assets
-      # ================================================
-
-      - name: Verify release assets
+      - name: Verify all packages and checksums
         shell: bash
         run: |
           set -euo pipefail
 
-          assets=(
+          expected=(
             mma-native-windows-amd64.zip
             mma-native-linux-amd64.zip
             mma-native-darwin-amd64.zip
             mma-native-darwin-arm64.zip
           )
 
-          for asset in "${assets[@]}"; do
-              archive="dist/$asset"
-              checksum="$archive.sha256"
+          for asset in "${expected[@]}"; do
+            archive="dist/$asset"
+            checksum="$archive.sha256"
 
-              if [ ! -f "$archive" ]; then
-                  echo "Missing archive: $archive"
-                  exit 1
-              fi
+            test -s "$archive" || {
+              echo "Missing or empty release asset: $archive" >&2
+              exit 1
+            }
+            test -s "$checksum" || {
+              echo "Missing checksum file: $checksum" >&2
+              exit 1
+            }
 
-              if [ ! -f "$checksum" ]; then
-                  echo "Missing checksum: $checksum"
-                  exit 1
-              fi
-
-              echo "Verifying $asset"
-
-              (
-                cd dist
-                sha256sum --check "$asset.sha256"
-              )
+            (cd dist && sha256sum --check "$asset.sha256")
           done
 
-          echo "All release assets verified successfully."
-
-          echo "Release contents:"
-          ls -lh dist/
-
-      # ================================================
-      # Publish release
-      # ================================================
+          echo 'All native packages passed SHA-256 verification.'
+          ls -lh dist
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v3.0.3
         with:
           tag_name: ${{ github.ref_name }}
-
           generate_release_notes: true
-
-          working_directory: dist
-
-          files: |
-            *.zip
-            *.sha256
-
           fail_on_unmatched_files: true
           overwrite_files: true
+          files: |
+            dist/*.zip
+            dist/*.sha256

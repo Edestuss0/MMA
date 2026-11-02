@@ -56,7 +56,7 @@ fn framer_config_rejects_bad_header_positions() {
         options_order: 1,
         payload_order: 2,
         route_order: 1,
-        big_bytes_config: BigBytesConfig::new()
+        big_bytes_config: BigBytesConfig::new(),
     };
     assert!(base.validate().is_err());
 }

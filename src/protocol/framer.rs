@@ -362,7 +362,13 @@ fn encode_headers(
 
     dst[frame_start + (config.options_count_pos - 1) as usize] = options_count;
 
-    encode_big_bytes(dst, frame_start, config.header_length, &config.big_bytes_config, (options_len, payload_len, headers.req_id));
+    encode_big_bytes(
+        dst,
+        frame_start,
+        config.header_length,
+        &config.big_bytes_config,
+        (options_len, payload_len, headers.req_id),
+    );
 
     Ok(())
 }
@@ -409,9 +415,19 @@ fn decode_headers(bytes: &[u8], config: &FramerConfig) -> Result<RequestHeaders,
         });
     }
 
-    let big_bytes: &[u8; 12] = (&bytes[bytes.len() - 12..]).try_into().map_err(|_| ProtocolError::InvalidFrame {message: "Invalid big bytes trail", req_id: None})?;
+    let big_bytes: &[u8; 12] =
+        (&bytes[bytes.len() - 12..])
+            .try_into()
+            .map_err(|_| ProtocolError::InvalidFrame {
+                message: "Invalid big bytes trail",
+                req_id: None,
+            })?;
 
-    let (payload_len, options_len, req_id) = decode_big_bytes(big_bytes, &config.big_bytes_config).map_err(|_| ProtocolError::InvalidFrame {message: "Invalid big bytes trail", req_id: None})?;
+    let (payload_len, options_len, req_id) = decode_big_bytes(big_bytes, &config.big_bytes_config)
+        .map_err(|_| ProtocolError::InvalidFrame {
+            message: "Invalid big bytes trail",
+            req_id: None,
+        })?;
 
     let opcode: RequestOpcode = match bytes.get((config.opcode_pos - 1) as usize) {
         Some(&value) => match RequestOpcode::try_from(value) {
