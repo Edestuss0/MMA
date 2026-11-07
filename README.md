@@ -231,7 +231,7 @@ frame_len = header_length + body_len                 (checked addition)
 | `NotFound` | 5 | Unknown route | Payload `"No such method"` |
 | `Conflict` | 6 | State conflict | Second `ChannelConnect` |
 | `InternalError` | 7 | Server error | Handler panic |
-| `ChannelMessage` | 8 | Server push | Delivered via `send_to_channel` |
+| `ChannelMessage` | 8 | Server push | Delivered via `send_to_channel` / `try_send_to_channel` |
 | `Shutdown` | 9 | Server stopping | Reserved; not currently sent |
 | `ChannelConnected` | 10 | Channel established | Reply to `ChannelConnect` |
 | `Timeout` | 11 | Handler timed out | `request_timeout` expired |
@@ -367,7 +367,7 @@ Rust access: `Request::get_option(&self, key: &[u8]) -> Option<Bytes>` (no data 
 | `Once` | `ChannelConnect` / `ChannelMessage` | `BadRequest` (type mismatch) | `Once` |
 | `Channel` | `ChannelConnect` | `Conflict` | `Channel` |
 | `Channel` | `ChannelMessage` | channel handler | `Channel` |
-| `Channel` | `ChannelMessage`, route `CHANNEL_DISCONNECT` | disconnect hook runs, the connection is then closed; see [§5.5](#55-reserved-routes-and-connection-lifecycle-hooks) | closing |
+| `Channel` | `ChannelMessage`, route `CHANNEL_DISCONNECT` | disconnect hook runs, the channel is unregistered, the connection is closed, no response; see [§5.5](#55-reserved-routes-and-connection-lifecycle-hooks) | closing |
 | `Channel` | `Once` | `BadRequest` (type mismatch) | `Channel` |
 
 Use one mode per connection and do not send `Once` and `ChannelConnect` concurrently on a fresh connection.
@@ -375,7 +375,7 @@ Use one mode per connection and do not send `Once` and `ChannelConnect` concurre
 ### 5.3. Request/response (Once)
 
 - The client chooses `req_id`; the server returns it unchanged.
-- A connection can carry many requests in flight (limits: 256 per connection, `max_in_flight` globally).
+- A connection can carry many requests in flight. The only cap is `max_in_flight` for the whole server; there is no per-connection limit.
 - **Responses may arrive in a different order** than requests. Correlate by `req_id`.
 - If a handler exceeds `request_timeout`, the server answers `Timeout` (11). Cancellation takes effect at the next `.await`; blocking code is not interrupted.
 - A handler panic is caught and answered with `InternalError`; the connection stays open.
@@ -384,10 +384,17 @@ Use one mode per connection and do not send `Once` and `ChannelConnect` concurre
 ### 5.4. Channel mode
 
 - `ChannelConnect` switches the connection to Channel mode; the server assigns a connection id (`conn_id`) and does not send it to the client.
-- The server pushes messages with `ServerHandle::send_to_channel(conn_id, Response)`. **`conn_id = 0` broadcasts to all channel connections.** Your channel handler receives the `conn_id` of the sender connection.
-- Set the pushed response's `opcode` to `ChannelMessage` (8) yourself.
-- `Ok(())` from `send_to_channel` means "accepted into the broadcast queue", not "delivered". `Err(())` means there are no subscribers.
-- The broadcast queue holds 1024 messages. A slow receiver loses messages (`Lagged`).
+- The server pushes messages through `ServerHandle`:
+
+  | Method | Waits? | Failure |
+  |---|---|---|
+  | `send_to_channel(conn_id, Response).await` | yes — until the receiver's queue has room | `Err(String)` |
+  | `try_send_to_channel(conn_id, Response)` | no | `Err(String)` if the queue is full or the channel is gone |
+
+  **`conn_id = 0` broadcasts to every channel connection.** Your channel handler receives the `conn_id` of the sender connection. Set the pushed response's `opcode` to `ChannelMessage` (8) yourself.
+- Every channel connection has its own queue of **256 messages**. A message to one `conn_id` goes straight to that connection (a hash lookup), not to everybody. An unknown `conn_id` gives `Err("No such channel")`. A broadcast with no channel connections is `Ok`.
+- `Ok(())` means "accepted into the receiver's queue", not "delivered". Messages are not dropped silently: if a queue is full, `send_to_channel` waits and `try_send_to_channel` fails.
+- **A receiver that does not read blocks broadcasts.** `send_to_channel(0, ..)` visits the connections one by one and waits on a full queue, so one stalled client delays everybody behind it (measured on loopback: with one silent client and 64 KiB messages, another client stopped receiving after about 1300 of 3000). On the first failure `send_to_channel(0, ..)` stops and the remaining connections do not get that message; `try_send_to_channel(0, ..)` tries all and reports `Partial broadcast: N/M channels accepted the message`. For broadcasts to untrusted clients use `try_send_to_channel`, or wrap `send_to_channel` in `tokio::time::timeout`.
 - Push messages and regular responses share one outgoing queue; their relative order is not guaranteed.
 
 ### 5.5. Reserved routes and connection lifecycle hooks
@@ -405,9 +412,11 @@ Behaviour:
 - `CHANNEL_DISCONNECT` is honoured only in `Channel` state; otherwise the answer is `BadRequest` ("Channel not connected").
 - Hooks are optional. Without a registered hook the lifecycle route still works, it just runs no user code.
 - The hook receives a `Request` copy of the client frame; it returns nothing and cannot reject the connection.
-- After the disconnect hook the frame is still routed to channel handlers. If you did not register a handler named `CHANNEL_DISCONNECT`, the client receives `NotFound` ("No such method") just before the close. Ignore that reply.
-- The connection is closed after the in-flight work drains (about `drain_timeout` plus the writer flush; ≈ 4 s was observed with the example's `drain_timeout` of 2 s).
-- A dropped TCP connection (no `CHANNEL_DISCONNECT` frame) does **not** run the disconnect hook.
+- `CHANNEL_DISCONNECT` produces no response: after the hook the server unregisters the channel and closes the connection. The frame is not routed to channel handlers. A message the hook pushes to the same connection is lost, because the channel is already being closed.
+- A panic in the connect hook is caught: the client gets `InternalError`, the channel registration is rolled back and the connection stays `Fresh`. A panic in the disconnect hook is answered with `InternalError` and the connection is not closed.
+- The wrong-route answer for `ChannelConnect` is `BadRequest` with the payload `"Route must match the opcode"`. The channel is registered only after the route check.
+- A dropped TCP connection (EOF, reset) unregisters the channel but does **not** run the user's disconnect hook. Do not rely on the hook alone to release per-connection state.
+- State changes of one connection are decided one frame at a time (a one-permit semaphore per connection). The connect hook runs inside that step, so a slow hook delays the next frames of the same connection.
 
 ---
 
@@ -503,7 +512,7 @@ router.register_channel_handler("SEND".to_string(), {
             let mut msg = Response::new(0);
             msg.headers.opcode = ResponseOpcode::ChannelMessage;
             msg.payload = req.payload;
-            let _ = handle.send_to_channel(0, msg);   // 0 = everyone
+            let _ = handle.send_to_channel(0, msg).await;   // 0 = everyone
         }
     }
 })?;
@@ -538,7 +547,7 @@ router.register_on_channel_connect_handler({
             let mut msg = Response::new(0);
             msg.headers.opcode = ResponseOpcode::ChannelMessage;
             msg.payload = Bytes::from(format!("connected: {conn_id}, payload: {} bytes", req.payload.len()));
-            let _ = handle.send_to_channel(0, msg);
+            let _ = handle.send_to_channel(0, msg).await;
         }
     }
 });
@@ -573,7 +582,7 @@ Shutdown: accepting stops, readers stop, running handlers get `shutdown_grace`, 
 | `Server::new` | `io::Error` | invalid config or bind failure |
 | `Router::register_route` / `register_channel_handler` | `Err` | empty or too long route, duplicate route |
 | `Router::register_on_channel_connect_handler` / `register_on_channel_disconnect_handler` | — | infallible; a new call replaces the old hook |
-| `ServerHandle::send_to_channel` | `Err(())` | no subscribers |
+| `ServerHandle::send_to_channel` / `try_send_to_channel` | `Err(String)` | unknown `conn_id`, closed receiver, full queue (`try_` only), partial broadcast |
 | `Config::validate` | `ConfigError` | zero limit, port 0, invalid `FramerConfig` |
 | `Server::run` / `run_until` | `io::Error` | listener/accept failure |
 
@@ -581,7 +590,7 @@ Shutdown: accepting stops, readers stop, running handlers get `shutdown_grace`, 
 
 ## 8. C ABI
 
-Header: [`include/mma.h`](include/mma.h). Library: `libMMA.so` / `libMMA.dylib` / `MMA.dll` and `libMMA.a` in `target/release/` after `cargo build --release`. Verified on Linux x86-64 only.
+Header: [`include/mma.h`](include/mma.h). Prebuilt packages are attached to each GitHub Release for `v*` tags (Windows x86-64, Linux x86-64, macOS x86-64 and arm64): the library, `mma.h` and, on Windows, the MSVC import library, with a `.sha256` file for each archive. Library: `libMMA.so` / `libMMA.dylib` / `MMA.dll` and `libMMA.a` in `target/release/` after `cargo build --release`. Verified on Linux x86-64 only.
 
 ### 8.1. Functions
 
@@ -597,7 +606,7 @@ Header: [`include/mma.h`](include/mma.h). Library: `libMMA.so` / `libMMA.dylib` 
 | `mma_server_start` | start an OS thread and a Tokio runtime, bind, wait for readiness | `MMA_OK` only after a successful bind |
 | `mma_server_local_port` | return the port | call after `start` |
 | `mma_server_get_handle` | get a server handle (clone of `ServerHandle`) | after `start`; free with `mma_server_handle_destroy` |
-| `mma_server_handle_send_to_channel` | push a response to channels | `conn_id == 0` broadcasts |
+| `mma_server_handle_send_to_channel` | push a response to channels without waiting | `conn_id == 0` broadcasts; returns `MMA_SERVER_ERROR` if the target is unknown, its queue (256) is full, or a broadcast was only partly accepted |
 | `mma_server_handle_change_config` | send a new configuration to the running server | not all fields apply at runtime |
 | `mma_server_handle_destroy` | free the handle | does not stop the server |
 | `mma_server_stop` | cancel and join the server thread | never call from a callback of the same server |
@@ -704,8 +713,8 @@ Three versions are independent:
 | What | Now | Rule |
 |---|---|---|
 | Wire protocol | `MMA_VERSION = 1` | bumped on incompatible frame or semantics changes |
-| Rust crate | `0.1.0` | before 1.0, breaking changes may occur in any release |
-| C ABI / `mma.h` | unversioned | additions since the last commit are backward compatible (two new functions); no runtime version query |
+| Rust crate | `0.1.0` in `Cargo.toml` (git tags go up to `v0.1.3`) | before 1.0, breaking changes may occur in any release; the push API changed (see [CHANGELOG.md](CHANGELOG.md)) |
+| C ABI / `mma.h` | unversioned | signatures unchanged since the lifecycle-hook functions were added; `mma_server_handle_send_to_channel` changed behaviour (non-waiting, per-channel queue); no runtime version query |
 
 Two peers are wire-compatible only if `MMA_VERSION` **and** the whole `FramerConfig` match. Note: the reserved-route rule for `ChannelConnect` ([§5.5](#55-reserved-routes-and-connection-lifecycle-hooks)) changes request semantics without changing the frame layout or `MMA_VERSION`; see [CHANGELOG.md](CHANGELOG.md). Adding opcodes or a mandatory field requires a new `MMA_VERSION`; an old server closes the connection on an unknown request opcode.
 
@@ -722,10 +731,11 @@ Two peers are wire-compatible only if `MMA_VERSION` **and** the whole `FramerCon
 | Route | ≤ 255 bytes |
 | Options | ≤ 255 per frame; key and value 1–65535 bytes |
 | Connections | `max_connections` |
-| In-flight requests | `max_in_flight` globally, 256 per connection |
+| In-flight requests | `max_in_flight` globally; no per-connection cap |
+| Channel push queue | 256 messages per channel connection |
 | Handler time | `request_timeout` (async code only) |
 
-Not covered yet: idle/read/write timeouts (slow-client attacks), a global byte budget for in-flight data, and protection against clients that do not read responses (see below).
+Not covered yet: idle/read/write timeouts (slow-client attacks), a global byte budget for in-flight data, and protection against clients that do not read responses (they also stall `send_to_channel(0, ..)`, see [§5.4](#54-channel-mode)).
 
 ---
 
@@ -740,5 +750,6 @@ Not covered yet: idle/read/write timeouts (slow-client attacks), a global byte b
 | `include/mma.h` | C header |
 | `examples/main_server.rs`, `examples/main_server.c` | Rust and C server examples (the Rust one also shows the connect/disconnect hooks) |
 | `mma_gui_client.py` | Tkinter test client (Python standard library): configurable layout, all three opcodes, a codec self-test |
+| `.github/workflows/native-release.yml` | CI on every push (Rust tests, C example compiled with `-Werror`, C++ header check); on `v*` tags it builds the native packages and publishes the Release |
 | `CHANGELOG.md` | history of changes with wire / Rust API / C ABI impact |
 | `tests/` | configuration tests (codec tests are currently disabled) |

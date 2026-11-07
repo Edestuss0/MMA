@@ -953,9 +953,9 @@ pub unsafe extern "C" fn mma_server_handle_send_to_channel(
     let handle = unsafe { &*handle };
     let message = unsafe { (&*message.response).clone() };
 
-    match handle.inner.send_to_channel(conn_id, message) {
+    match handle.inner.try_send_to_channel(conn_id, message) {
         Ok(()) => MMA_OK,
-        Err(()) => MMA_SERVER_ERROR,
+        Err(_) => MMA_SERVER_ERROR,
     }
 }
 

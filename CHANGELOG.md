@@ -14,7 +14,49 @@ Every entry states its impact on the three compatibility surfaces separately (se
 
 ## [Unreleased]
 
-Baseline: commit `432905c` ("added README"). Candidate version: **0.2.0**, because request semantics changed (see *Changed → Wire*). `Cargo.toml` still says `0.1.0`, and `MMA_VERSION` is still `1`.
+Changes since `v0.1.3` (commit `95a5abb`). Suggested version: **0.2.0** — the Rust push API is incompatible with 0.1.x, and `MMA_VERSION` stays `1` (frame layout and request semantics are unchanged by these edits).
+
+### Changed
+
+- **Channel delivery model — Rust, ABI (behaviour).** The shared `tokio::sync::broadcast` channel (1024 messages, filtered by `conn_id` in every connection) is replaced by `ChannelHub`: a table of one `mpsc` queue per channel connection, **256 messages** each.
+  - A message for one `conn_id` goes only to that connection (hash lookup) instead of waking every channel connection.
+  - Messages are no longer dropped with `Lagged`. When a queue is full the sender waits (`send_to_channel`) or gets an error (`try_send_to_channel`, C ABI).
+  - An unknown `conn_id` is now an error (`"No such channel"`). A broadcast when no channel connection exists is now `Ok` (it was `Err`).
+  - **Trade-off:** `send_to_channel(0, ..)` waits on each connection in turn. One client that does not read stalls the broadcast for all others. Measured on loopback with `examples/main_server`: one silent client, 64 KiB messages — a second client received 1322 of 3000 and then nothing, including a later small message.
+- **Rust API (breaking).**
+  - `ServerHandle::send_to_channel` is now `async fn(&self, id: u32, item: Response) -> Result<(), String>` (was a synchronous `Result<(), ()>`). Callers must `.await` it.
+  - New `ServerHandle::try_send_to_channel(&self, id, item) -> Result<(), String>` that does not wait. With `id = 0` it tries every channel and returns `Partial broadcast: N/M channels accepted the message` on partial failure.
+  - Removed `core::commands::ChannelSendedMessage`.
+  - New public `core::server::ChannelHub` (`register`, `disconnect`, `send`, `try_send`).
+- **C ABI (behaviour, signatures unchanged).** `mma_server_handle_send_to_channel` now uses the non-waiting path. It returns `MMA_SERVER_ERROR` for an unknown `conn_id`, a full queue (256) or a partly accepted broadcast. Callers that treated `MMA_OK` as "some subscriber exists" must review this.
+- **Per-connection request limit removed.** The per-connection semaphore of 256 permits is now a one-permit semaphore that serialises connection-state decisions. The only in-flight cap is `max_in_flight` for the whole server, so one connection can use all of it.
+- `ChannelConnect` with a wrong route: the `BadRequest` payload is now `"Route must match the opcode"` (was `"Route must be doesn't match by opcode"`). *Wire (text only)*
+- `examples/main_server.rs` awaits `send_to_channel`.
+
+### Fixed
+
+- **`ChannelConnect` no longer allocates the channel before the route check** (known issue 1 of 0.1.3). A wrong route leaves nothing behind.
+- **`CHANNEL_DISCONNECT` no longer gets a `NotFound` reply** (known issue 2 of 0.1.3). After the hook the channel is unregistered and the connection is closed without a response; the frame is not routed to channel handlers.
+- **A closed connection unregisters its channel** on EOF, read error, shutdown and after `CHANNEL_DISCONNECT`. (The user-level disconnect hook still does not run on a dropped connection; see below.)
+- **State race on a fresh connection.** The state decision for each frame is taken under a one-permit semaphore, so two frames can no longer both pass as `Fresh` (e.g. `Once` and `ChannelConnect`, or two `ChannelConnect`). Found by code reading; there is no automated race test.
+- **Hook panics are contained.** A panic in the connect hook rolls back the channel registration and answers `InternalError`; a panic in the disconnect hook answers `InternalError`.
+- A connect with an internal registration error answers `InternalError` instead of a half-open channel.
+- Removed the debug `println!("connect, N")` on every channel connect.
+
+### Known issues
+
+1. A client that does not read stalls `send_to_channel(0, ..)` for everybody (see *Changed*). Use `try_send_to_channel`, or `tokio::time::timeout`, for broadcasts to untrusted clients.
+2. `send_to_channel(0, ..)` stops at the first failing connection; the connections after it do not get the message.
+3. The user's disconnect hook runs only for an explicit `CHANNEL_DISCONNECT`, not for a dropped TCP connection. A message that the hook sends to its own connection is lost.
+4. A connect hook runs while the connection's state permit is held, so a slow hook delays the next frames of that connection.
+5. One connection can occupy the whole `max_in_flight` budget (no per-connection cap).
+6. No automated tests for the hub, the lifecycle hooks or the state race. The 14 existing tests pass. Verified manually: `cargo build --release`, `cargo test --locked --all-targets`, the C example compiles with `-std=c11 -Wall -Wextra -Werror`, and a live session against `examples/main_server` (wrong route → `BadRequest`; connect hook push; second connect → `Conflict`; `CHANNEL_DISCONNECT` → connection closed with no reply; `CHANNEL_DISCONNECT` on a fresh connection → `BadRequest`; the silent-client test above).
+7. `Cargo.toml` has `version = "0.1.0"` while tags `v0.1.0`–`v0.1.3` exist. Tags `v0.1.0`–`v0.1.2` are on a separate line of history (Go bindings) and are not ancestors of `master`.
+8. 17 source and workflow files use CRLF line endings. Add a `.gitattributes` (`* text=auto eol=lf`) so the diffs stay readable.
+
+## [0.1.3] - 2026-11-02
+
+Tag `v0.1.3` (commit `95a5abb`). Changes since commit `432905c` ("added README"). `Cargo.toml` still says `0.1.0` although the tags go up to `v0.1.3`, and `MMA_VERSION` is still `1`.
 
 ### Added
 
@@ -25,7 +67,8 @@ Baseline: commit `432905c` ("added README"). Candidate version: **0.2.0**, becau
 - `Request` implements `Clone`. *Rust*
 - `examples/main_server.rs` shows both hooks (they push `Connect: …` / `Disconnect: …` messages to all channels).
 - `mma_gui_client.py`: a Tkinter test client using only the Python standard library. It takes the full layout (`FramerConfig`), sends all three request opcodes, decodes responses and has a codec self-test.
-- README (`README.md`, `README.ru.md`): §5.5 (reserved routes and hooks), hook examples for Rust and C, the new C functions, updated threading rules, limitations and repository layout. `CHANGELOG.md` and `CHANGELOG.ru.md`.
+- README (`README.md`, `README.ru.md`): §5.5 (reserved routes and hooks), hook examples for Rust and C, the new C functions, updated threading rules and repository layout. `CHANGELOG.md` and `CHANGELOG.ru.md`.
+- GitHub Actions workflow `.github/workflows/native-release.yml`: on every push it runs `cargo test`, builds the release libraries, compiles the C example with `-Werror` and checks that `mma.h` compiles as C++. On `v*` tags it builds native packages for Windows x86-64, Linux x86-64, macOS x86-64 and macOS arm64 (library + `mma.h`, plus the MSVC import library on Windows, with SHA-256 files) and publishes a GitHub Release. The first version of the workflow compiled a `native-bridge/bridge.c` that is not on `master`; later commits removed that step.
 
 ### Changed
 
@@ -43,9 +86,9 @@ Baseline: commit `432905c` ("added README"). Candidate version: **0.2.0**, becau
 
 - A synchronous C callback no longer blocks a Tokio async worker (see *Changed → ABI*). This removes the main starvation risk named in the previous README ("callbacks run on worker threads").
 
-### Known issues in this change
+### Known issues at this tag
 
-These exist in the current working tree and are documented in README §11. They are not fixed here.
+Items 1 and 2 are fixed in *Unreleased* above; item 3 is still open.
 
 1. `ChannelConnect` runs the connect closure (which allocates the channel subscription) **before** checking the route, so a wrong route can leave an unused subscription. Found by code reading, not measured.
 2. After the disconnect hook the frame still goes to channel-handler routing. Without a handler named `CHANNEL_DISCONNECT` the client receives `NotFound` ("No such method") before the connection closes. Observed in a live test.
@@ -54,4 +97,5 @@ These exist in the current working tree and are documented in README §11. They 
 5. Hooks and the reserved-route checks have no automated tests. Verified manually: `cargo build --release`, `cargo test` (14 tests pass, unchanged), the C example compiles against the new header, all 20 `mma_*` functions of the header are exported, and a live session against `examples/main_server` (wrong route → `BadRequest`; connect hook → push `Connect: …`; second connect → `Conflict`; disconnect → hook push, `NotFound`, close after ≈ 4 s with `drain_timeout` 2 s; `CHANNEL_DISCONNECT` on a fresh connection → `BadRequest`).
 6. Line endings: 18 files in the working tree use CRLF (a content-free change against the commit). Add a `.gitattributes` (`* text=auto eol=lf`) before committing so the diff stays readable.
 
-[Unreleased]: https://github.com/Edestuss0/MMA-Network-protocol/compare/432905c...HEAD
+[Unreleased]: https://github.com/Edestuss0/MMA-Network-protocol/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/Edestuss0/MMA-Network-protocol/compare/432905c...v0.1.3

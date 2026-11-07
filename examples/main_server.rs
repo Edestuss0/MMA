@@ -165,7 +165,7 @@ async fn send(req: Request, _: u32, handle: ServerHandle) {
     let mut response = Response::new(0);
     response.payload = payload;
 
-    let _ = handle.send_to_channel(0, response);
+    let _ = handle.send_to_channel(0, response).await;
 }
 
 async fn disconnect(req: Request, conn_id: u32, handle: ServerHandle) {
@@ -177,7 +177,7 @@ async fn disconnect(req: Request, conn_id: u32, handle: ServerHandle) {
     let mut response = Response::new(0);
     response.payload = Bytes::from(format!("Disconnect: payload: {}, id: {}", payload, conn_id));
 
-    let _ = handle.send_to_channel(0, response);
+    let _ = handle.send_to_channel(0, response).await;
 }
 
 async fn connect(req: Request, conn_id: u32, handle: ServerHandle) {
@@ -189,5 +189,5 @@ async fn connect(req: Request, conn_id: u32, handle: ServerHandle) {
     let mut response = Response::new(0);
     response.payload = Bytes::from(format!("Connect: payload: {}, id: {}", payload, conn_id));
 
-    let _ = handle.send_to_channel(0, response);
+    let _ = handle.send_to_channel(0, response).await;
 }

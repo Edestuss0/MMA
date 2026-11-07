@@ -231,7 +231,7 @@ frame_len = header_length + body_len                 (checked-сложение)
 | `NotFound` | 5 | Route не найден | payload `"No such method"` |
 | `Conflict` | 6 | Конфликт состояния | Повторный `ChannelConnect` |
 | `InternalError` | 7 | Ошибка сервера | Panic обработчика |
-| `ChannelMessage` | 8 | Push от сервера | Доставка через `send_to_channel` |
+| `ChannelMessage` | 8 | Push от сервера | Доставка через `send_to_channel` / `try_send_to_channel` |
 | `Shutdown` | 9 | Сервер останавливается | Зарезервирован; сейчас не отправляется |
 | `ChannelConnected` | 10 | Канал установлен | Ответ на `ChannelConnect` |
 | `Timeout` | 11 | Таймаут обработчика | Истёк `request_timeout` |
@@ -367,7 +367,7 @@ options_key_first = false:  [key_len u16 BE][value_len u16 BE][value][key]
 | `Once` | `ChannelConnect` / `ChannelMessage` | `BadRequest` (несовпадение типа) | `Once` |
 | `Channel` | `ChannelConnect` | `Conflict` | `Channel` |
 | `Channel` | `ChannelMessage` | channel-обработчик | `Channel` |
-| `Channel` | `ChannelMessage`, route `CHANNEL_DISCONNECT` | запускается disconnect-хук, затем соединение закрывается; см. [§5.5](#55-зарезервированные-маршруты-и-хуки-жизненного-цикла-соединения) | закрывается |
+| `Channel` | `ChannelMessage`, route `CHANNEL_DISCONNECT` | запускается disconnect-хук, канал снимается с регистрации, соединение закрывается, ответа нет; см. [§5.5](#55-зарезервированные-маршруты-и-хуки-жизненного-цикла-соединения) | закрывается |
 | `Channel` | `Once` | `BadRequest` (несовпадение типа) | `Channel` |
 
 Используйте один режим на соединение и не отправляйте `Once` и `ChannelConnect` одновременно на новом соединении.
@@ -375,7 +375,7 @@ options_key_first = false:  [key_len u16 BE][value_len u16 BE][value][key]
 ### 5.3. Запрос/ответ (Once)
 
 - `req_id` выбирает клиент; сервер возвращает его без изменений.
-- По одному соединению может идти много запросов (лимиты: 256 на соединение, `max_in_flight` глобально).
+- По одному соединению может идти много запросов. Единственный предел — `max_in_flight` на весь сервер; лимита на соединение нет.
 - **Ответы могут приходить не в порядке запросов.** Сопоставляйте по `req_id`.
 - Если обработчик превысил `request_timeout`, сервер отвечает `Timeout` (11). Отмена срабатывает на ближайшем `.await`; блокирующий код не прерывается.
 - Panic обработчика перехватывается и превращается в `InternalError`; соединение остаётся открытым.
@@ -384,10 +384,17 @@ options_key_first = false:  [key_len u16 BE][value_len u16 BE][value][key]
 ### 5.4. Режим Channel
 
 - `ChannelConnect` переводит соединение в режим Channel; сервер присваивает идентификатор соединения (`conn_id`) и не сообщает его клиенту.
-- Сервер отправляет push через `ServerHandle::send_to_channel(conn_id, Response)`. **`conn_id = 0` — рассылка всем channel-соединениям.** Channel-обработчик получает `conn_id` соединения-отправителя.
-- `opcode` отправляемого ответа нужно выставить в `ChannelMessage` (8) самостоятельно.
-- `Ok(())` от `send_to_channel` означает «принято в очередь рассылки», а не «доставлено». `Err(())` — нет подписчиков.
-- Очередь рассылки — 1024 сообщения. Медленный получатель теряет сообщения (`Lagged`).
+- Сервер отправляет push через `ServerHandle`:
+
+  | Метод | Ждёт? | Ошибка |
+  |---|---|---|
+  | `send_to_channel(conn_id, Response).await` | да — пока в очереди получателя не появится место | `Err(String)` |
+  | `try_send_to_channel(conn_id, Response)` | нет | `Err(String)`, если очередь полна или канала нет |
+
+  **`conn_id = 0` — рассылка всем channel-соединениям.** Channel-обработчик получает `conn_id` соединения-отправителя. `opcode` отправляемого ответа нужно выставить в `ChannelMessage` (8) самостоятельно.
+- У каждого channel-соединения своя очередь на **256 сообщений**. Сообщение для одного `conn_id` идёт сразу в это соединение (поиск по хеш-таблице), а не всем. Неизвестный `conn_id` даёт `Err("No such channel")`. Рассылка при отсутствии channel-соединений — `Ok`.
+- `Ok(())` означает «принято в очередь получателя», а не «доставлено». Сообщения не теряются молча: при полной очереди `send_to_channel` ждёт, а `try_send_to_channel` возвращает ошибку.
+- **Получатель, который не читает, блокирует рассылку.** `send_to_channel(0, ..)` обходит соединения по очереди и ждёт на полной очереди, поэтому один зависший клиент задерживает всех, кто идёт после него (замер на loopback: при одном молчащем клиенте и сообщениях по 64 КиБ другой клиент перестал получать после ≈ 1300 из 3000). При первой ошибке `send_to_channel(0, ..)` останавливается, и остальные соединения это сообщение не получают; `try_send_to_channel(0, ..)` пробует всех и возвращает `Partial broadcast: N/M channels accepted the message`. Для рассылки недоверенным клиентам используйте `try_send_to_channel` или оборачивайте `send_to_channel` в `tokio::time::timeout`.
 - Push-сообщения и обычные ответы идут через одну исходящую очередь; их взаимный порядок не гарантируется.
 
 ### 5.5. Зарезервированные маршруты и хуки жизненного цикла соединения
@@ -405,9 +412,11 @@ options_key_first = false:  [key_len u16 BE][value_len u16 BE][value][key]
 - `CHANNEL_DISCONNECT` учитывается только в состоянии `Channel`; иначе ответ — `BadRequest` («Channel not connected»).
 - Хуки необязательны. Без зарегистрированного хука служебный route работает, но пользовательский код не вызывается.
 - Хук получает копию `Request` клиентского кадра; он ничего не возвращает и не может отклонить соединение.
-- После disconnect-хука кадр всё равно попадает в маршрутизацию channel-обработчиков. Если обработчик с именем `CHANNEL_DISCONNECT` не зарегистрирован, клиент перед закрытием получит `NotFound` («No such method»). Этот ответ можно игнорировать.
-- Соединение закрывается после завершения активных задач (около `drain_timeout` плюс сброс writer; при `drain_timeout` = 2 с в примере наблюдалось ≈ 4 с).
-- Обрыв TCP-соединения (без кадра `CHANNEL_DISCONNECT`) disconnect-хук **не** запускает.
+- `CHANNEL_DISCONNECT` не даёт ответа: после хука сервер снимает канал с регистрации и закрывает соединение. В channel-обработчики кадр не попадает. Сообщение, которое хук отправляет в это же соединение, теряется: канал уже закрывается.
+- Panic в connect-хуке перехватывается: клиент получает `InternalError`, регистрация канала откатывается, соединение остаётся `Fresh`. Panic в disconnect-хуке даёт `InternalError`, соединение не закрывается.
+- Ответ на `ChannelConnect` с неверным route — `BadRequest` с payload `"Route must match the opcode"`. Канал регистрируется только после проверки route.
+- Обрыв TCP-соединения (EOF, reset) снимает канал с регистрации, но пользовательский disconnect-хук **не** запускает. Не полагайтесь только на хук для освобождения состояния соединения.
+- Смена состояния одного соединения решается по одному кадру за раз (семафор на одно разрешение). Connect-хук выполняется внутри этого шага, поэтому медленный хук задерживает следующие кадры того же соединения.
 
 ---
 
@@ -503,7 +512,7 @@ router.register_channel_handler("SEND".to_string(), {
             let mut msg = Response::new(0);
             msg.headers.opcode = ResponseOpcode::ChannelMessage;
             msg.payload = req.payload;
-            let _ = handle.send_to_channel(0, msg);   // 0 = всем
+            let _ = handle.send_to_channel(0, msg).await;   // 0 = всем
         }
     }
 })?;
@@ -538,7 +547,7 @@ router.register_on_channel_connect_handler({
             let mut msg = Response::new(0);
             msg.headers.opcode = ResponseOpcode::ChannelMessage;
             msg.payload = Bytes::from(format!("connected: {conn_id}, payload: {} bytes", req.payload.len()));
-            let _ = handle.send_to_channel(0, msg);
+            let _ = handle.send_to_channel(0, msg).await;
         }
     }
 });
@@ -573,7 +582,7 @@ router.register_on_channel_disconnect_handler(|req: Request, conn_id: u32| async
 | `Server::new` | `io::Error` | неверная конфигурация или ошибка bind |
 | `Router::register_route` / `register_channel_handler` | `Err` | пустой или слишком длинный route, дубликат |
 | `Router::register_on_channel_connect_handler` / `register_on_channel_disconnect_handler` | — | не возвращают ошибок; повторный вызов заменяет хук |
-| `ServerHandle::send_to_channel` | `Err(())` | нет подписчиков |
+| `ServerHandle::send_to_channel` / `try_send_to_channel` | `Err(String)` | неизвестный `conn_id`, закрытый получатель, полная очередь (только `try_`), частичная рассылка |
 | `Config::validate` | `ConfigError` | нулевой лимит, порт 0, неверный `FramerConfig` |
 | `Server::run` / `run_until` | `io::Error` | ошибка listener/accept |
 
@@ -581,7 +590,7 @@ router.register_on_channel_disconnect_handler(|req: Request, conn_id: u32| async
 
 ## 8. C ABI
 
-Заголовок: [`include/mma.h`](include/mma.h). Библиотека: `libMMA.so` / `libMMA.dylib` / `MMA.dll` и `libMMA.a` в `target/release/` после `cargo build --release`. Проверено только на Linux x86-64.
+Заголовок: [`include/mma.h`](include/mma.h). Готовые пакеты прикрепляются к каждому GitHub Release для тегов `v*` (Windows x86-64, Linux x86-64, macOS x86-64 и arm64): библиотека, `mma.h` и, для Windows, импортная библиотека MSVC, к каждому архиву — файл `.sha256`. Библиотека: `libMMA.so` / `libMMA.dylib` / `MMA.dll` и `libMMA.a` в `target/release/` после `cargo build --release`. Проверено только на Linux x86-64.
 
 ### 8.1. Функции
 
@@ -597,7 +606,7 @@ router.register_on_channel_disconnect_handler(|req: Request, conn_id: u32| async
 | `mma_server_start` | запускает OS-поток и Tokio runtime, выполняет bind, ждёт готовности | `MMA_OK` только после успешного bind |
 | `mma_server_local_port` | возвращает порт | вызывать после `start` |
 | `mma_server_get_handle` | получает handle сервера (клон `ServerHandle`) | после `start`; освобождать `mma_server_handle_destroy` |
-| `mma_server_handle_send_to_channel` | отправляет response в каналы | `conn_id == 0` — рассылка всем |
+| `mma_server_handle_send_to_channel` | отправляет response в каналы без ожидания | `conn_id == 0` — рассылка всем; `MMA_SERVER_ERROR`, если получатель неизвестен, его очередь (256) полна или рассылка принята частично |
 | `mma_server_handle_change_config` | отправляет новую конфигурацию работающему серверу | не все поля применяются на лету |
 | `mma_server_handle_destroy` | освобождает handle | сервер не останавливает |
 | `mma_server_stop` | отменяет работу и ждёт поток сервера | не вызывать из callback этого же сервера |
@@ -704,8 +713,8 @@ Wire-раскладка задаётся через `config.framer` (`MMA_Framer
 | Что | Сейчас | Правило |
 |---|---|---|
 | Wire-протокол | `MMA_VERSION = 1` | повышается при несовместимых изменениях кадра или семантики |
-| Rust crate | `0.1.0` | до 1.0 breaking-изменения возможны в любом релизе |
-| C ABI / `mma.h` | без версии | дополнения с последнего коммита обратно совместимы (две новые функции); запроса версии в рантайме нет |
+| Rust crate | `0.1.0` в `Cargo.toml` (git-теги доходят до `v0.1.3`) | до 1.0 breaking-изменения возможны в любом релизе; API push изменён (см. [CHANGELOG.ru.md](CHANGELOG.ru.md)) |
+| C ABI / `mma.h` | без версии | сигнатуры не менялись после добавления функций хуков; `mma_server_handle_send_to_channel` изменил поведение (без ожидания, очередь на канал); запроса версии в рантайме нет |
 
 Два участника совместимы по wire, только если совпадают `MMA_VERSION` **и** весь `FramerConfig`. Замечание: правило зарезервированного route для `ChannelConnect` ([§5.5](#55-зарезервированные-маршруты-и-хуки-жизненного-цикла-соединения)) меняет семантику запроса, не меняя раскладку кадра и `MMA_VERSION`; см. [CHANGELOG.ru.md](CHANGELOG.ru.md). Новые opcode или обязательное поле требуют новой `MMA_VERSION`; старый сервер закрывает соединение при неизвестном opcode запроса.
 
@@ -722,10 +731,11 @@ Wire-раскладка задаётся через `config.framer` (`MMA_Framer
 | Route | ≤ 255 байт |
 | Options | ≤ 255 на кадр; key и value по 1–65535 байт |
 | Соединения | `max_connections` |
-| Запросы в полёте | `max_in_flight` глобально, 256 на соединение |
+| Запросы в полёте | `max_in_flight` глобально; лимита на соединение нет |
+| Очередь push-сообщений | 256 сообщений на channel-соединение |
 | Время обработчика | `request_timeout` (только async-код) |
 
-Пока не покрыто: idle/read/write-таймауты (атаки медленными клиентами), глобальный лимит байт в полёте и защита от клиентов, не читающих ответы (см. ниже).
+Пока не покрыто: idle/read/write-таймауты (атаки медленными клиентами), глобальный лимит байт в полёте и защита от клиентов, не читающих ответы (они же останавливают `send_to_channel(0, ..)`, см. [§5.4](#54-режим-channel)).
 
 
 ---
@@ -741,5 +751,6 @@ Wire-раскладка задаётся через `config.framer` (`MMA_Framer
 | `include/mma.h` | C-заголовок |
 | `examples/main_server.rs`, `examples/main_server.c` | примеры Rust- и C-сервера (Rust-пример также показывает connect/disconnect-хуки) |
 | `mma_gui_client.py` | тестовый клиент на Tkinter (стандартная библиотека Python): настраиваемая раскладка, все три opcode, самотест кодека |
+| `.github/workflows/native-release.yml` | CI на каждый push (тесты Rust, C-пример с `-Werror`, проверка заголовка из C++); на тегах `v*` собирает нативные пакеты и публикует Release |
 | `CHANGELOG.md`, `CHANGELOG.ru.md` | история изменений с влиянием на wire / Rust API / C ABI |
 | `tests/` | тесты конфигурации (тесты кодека сейчас отключены) |

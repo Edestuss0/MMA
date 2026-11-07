@@ -130,12 +130,6 @@ pub struct Response {
     pub options: Vec<(Bytes, Bytes)>,
 }
 
-#[derive(Debug, Clone)]
-pub struct ChannelSendedMessage {
-    pub message: Response,
-    pub conn_id: u32,
-}
-
 impl Response {
     pub fn new(req_id: u32) -> Self {
         Self {

@@ -1,4 +1,3 @@
-use crate::core::commands::ChannelSendedMessage;
 use crate::core::commands::Response;
 use crate::core::config::Config;
 use crate::core::router::Router;
@@ -6,13 +5,15 @@ use crate::network::network::SocketStatus;
 use crate::network::network::serve_connection;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
 use std::{io, panic};
+use ahash::HashMap;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
-use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -22,26 +23,120 @@ pub struct Server {
     config: Config,
     tcp_listener: TcpListener,
     stop: CancellationToken,
-    channel_sender: broadcast::Sender<ChannelSendedMessage>,
     config_receiver: watch::Receiver<Config>,
     config_sender: watch::Sender<Config>,
+    channel_hub: Arc<ChannelHub>
+}
+
+#[derive(Debug, Default)]
+pub struct ChannelHub {
+    channels: RwLock<HashMap<u32, mpsc::Sender<Response>>>
+}
+
+impl ChannelHub {
+    pub fn register(&self, id: u32, sender: mpsc::Sender<Response>) -> Result<(), String> {
+        let mut guard = self.channels.write().map_err(|_| String::from("Cannot get access to list of channels"))?;
+        guard.insert(id, sender);
+        Ok(())
+    }
+
+    pub fn disconnect(&self, id: u32) -> Result<(), String> {
+        let mut guard = self.channels.write().map_err(|_| String::from("Cannot get access to list of channels"))?;
+        guard.remove(&id);
+        Ok(())
+    }
+
+    pub async fn send(&self, id: u32, item: Response) -> Result<(), String> {
+        if id == 0 {
+            let channels = {
+                let guard = self.channels.read().map_err(|_| String::from("Cannot get access to list of channel"))?;
+                guard.values().cloned().collect::<Vec<_>>()
+            };
+
+            for sender in channels {
+                if sender.send(item.clone()).await.is_err() {
+                    return Err(String::from("Error with sending"));
+                };
+            }
+        } else {
+            let sender = {
+                let guard = self.channels.read().map_err(|_| String::from("Cannot get access to list of channel"))?;
+    
+                match guard.get(&id).cloned() {
+                    Some(s) => s,
+                    None => {
+                        return Err(String::from("No such channel"));
+                    }
+                }
+            };
+    
+            if sender.send(item).await.is_err() {
+                return Err(String::from("Error with sending"));
+            };
+        }
+
+        Ok(())
+    }
+
+    pub fn try_send(&self, id: u32, item: Response,) -> Result<(), String> {
+        if id == 0 {
+            let senders = {
+                let guard = self.channels.read().map_err(|_| String::from("Cannot get access to list of channel"))?;
+
+                guard.values().cloned().collect::<Vec<_>>()
+            };
+
+            let total = senders.len();
+            let mut delivered = 0;
+            let mut failed = 0;
+
+            for sender in senders {
+                match sender.try_send(item.clone()) {
+                    Ok(()) => delivered += 1,
+                    Err(e) => {
+                        failed += 1;
+                        eprintln!("Broadcast error: {e}");
+                    }
+                }
+            }
+
+            if failed == 0 {
+                return Ok(());
+            } else {
+                return Err(format!(
+                    "Partial broadcast: {delivered}/{total} channels accepted the message"
+                ));
+            }
+        } else {
+            let sender = {
+                let guard = self.channels.read().map_err(|_| String::from("Cannot get access to list of channel"))?;
+    
+                match guard.get(&id).cloned() {
+                    Some(s) => s,
+                    None => {
+                        return Err(String::from("No such channel"));
+                    }
+                }
+            };
+    
+            if sender.try_send(item).is_err() {
+                return Err(String::from("Error with sending"));
+            };
+        }
+
+
+        Ok(())
+    }
+
 }
 
 #[derive(Clone)]
 pub struct ServerHandle {
-    channel_sender: broadcast::Sender<ChannelSendedMessage>,
     config_sender: watch::Sender<Config>,
+    channel_hub: Arc<ChannelHub>
 }
 
 impl ServerHandle {
-    pub fn send_to_channel(&self, conn_id: u32, message: Response) -> Result<(), ()> {
-        let sender = self.channel_sender.clone();
-        if let Err(_) = sender.send(ChannelSendedMessage { message, conn_id }) {
-            return Err(());
-        }
-        Result::Ok(())
-    }
-
     pub fn change_config(&self, config: Config) -> Result<(), std::io::Error> {
         Server::validate_config(&config)?;
 
@@ -54,6 +149,14 @@ impl ServerHandle {
 
         Ok(())
     }
+
+    pub async fn send_to_channel(&self, id: u32, item: Response) -> Result<(), String> {
+        self.channel_hub.send(id, item).await
+    }
+
+    pub fn try_send_to_channel(&self, id: u32, item: Response) -> Result<(), String> {
+        self.channel_hub.try_send(id, item)
+    }
 }
 
 impl Server {
@@ -65,7 +168,7 @@ impl Server {
 
     pub fn handle(&self) -> ServerHandle {
         ServerHandle {
-            channel_sender: self.channel_sender.clone(),
+            channel_hub: Arc::clone(&self.channel_hub),
             config_sender: self.config_sender.clone(),
         }
     }
@@ -75,15 +178,14 @@ impl Server {
         tcp_listener: TcpListener,
     ) -> Result<Self, std::io::Error> {
         Self::validate_config(&config)?;
-        let (channel_sender, _) = broadcast::channel::<ChannelSendedMessage>(1024);
         let (config_sender, config_receiver) = watch::channel::<Config>(config.clone());
         Result::Ok(Self {
             config,
             tcp_listener,
             stop: CancellationToken::new(),
-            channel_sender,
             config_receiver,
             config_sender,
+            channel_hub: Arc::new(ChannelHub::default())
         })
     }
 
@@ -151,7 +253,8 @@ impl Server {
 
             let _ = socket.set_nodelay(true);
 
-            let channel_sender = self.channel_sender.clone();
+            let channel_hub_disc = Arc::clone(&self.channel_hub);
+            let channel_hub = Arc::clone(&self.channel_hub);
 
             conns.spawn(serve_connection(
                 socket,
@@ -163,8 +266,14 @@ impl Server {
                 permit,
                 move || {
                     let conn_id = current_channel_connection_id.fetch_add(1, Ordering::Relaxed);
-                    println!("connect, {}", conn_id);
-                    (SocketStatus::Channel(conn_id), channel_sender.subscribe())
+                    let (sender, receiver) = mpsc::channel::<Response>(256);
+                    if let Err(e) = channel_hub.register(conn_id, sender) {
+                        return Err(e);
+                    }
+                    Ok((SocketStatus::Channel(conn_id), receiver))
+                },
+                move |id| {
+                    channel_hub_disc.disconnect(id)
                 },
             ));
         }
