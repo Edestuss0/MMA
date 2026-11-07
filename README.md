@@ -8,8 +8,6 @@
 
 </div>
 
-> **Status:** pre-release `0.1.0` · wire protocol version `1` · the API and the C ABI may change without notice. History of changes: [CHANGELOG.md](CHANGELOG.md).
-
 MMA is a private, binary, request/response and channel protocol over TCP. Its defining feature: **there is no single fixed wire format.** The byte layout of a frame is defined by a configuration (`FramerConfig`) that both peers share, so two deployments with different configurations look like two different, incompatible protocols on the wire.
 
 This document specifies the frame format, the connection model, the Rust API and the C ABI.

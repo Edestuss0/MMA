@@ -127,16 +127,6 @@ Tag `v0.1.3` (commit `95a5abb`). Changes since commit `432905c` ("added README")
 
 - A synchronous C callback no longer blocks a Tokio async worker (see *Changed → ABI*). This removes the main starvation risk named in the previous README ("callbacks run on worker threads").
 
-### Known issues at this tag
-
-Items 1 and 2 are fixed in *Unreleased* above; item 3 is still open.
-
-1. `ChannelConnect` runs the connect closure (which allocates the channel subscription) **before** checking the route, so a wrong route can leave an unused subscription. Found by code reading, not measured.
-2. After the disconnect hook the frame still goes to channel-handler routing. Without a handler named `CHANNEL_DISCONNECT` the client receives `NotFound` ("No such method") before the connection closes. Observed in a live test.
-3. A dropped TCP connection does not run the disconnect hook; only the explicit `CHANNEL_DISCONNECT` frame does.
-4. Reserved routes are compared with `to_uppercase()` on each request (case-insensitive, allocating). The empty `if` in the `Fresh`/`ChannelMessage` branch is dead code.
-5. Hooks and the reserved-route checks have no automated tests. Verified manually: `cargo build --release`, `cargo test` (14 tests pass, unchanged), the C example compiles against the new header, all 20 `mma_*` functions of the header are exported, and a live session against `examples/main_server` (wrong route → `BadRequest`; connect hook → push `Connect: …`; second connect → `Conflict`; disconnect → hook push, `NotFound`, close after ≈ 4 s with `drain_timeout` 2 s; `CHANNEL_DISCONNECT` on a fresh connection → `BadRequest`).
-6. Line endings: 18 files in the working tree use CRLF (a content-free change against the commit). Add a `.gitattributes` (`* text=auto eol=lf`) before committing so the diff stays readable.
 
 [Unreleased]: https://github.com/Edestuss0/MMA-Network-protocol/compare/v0.1.4...HEAD
 [0.1.4]: https://github.com/Edestuss0/MMA-Network-protocol/compare/v0.1.3...v0.1.4
