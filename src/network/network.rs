@@ -2,7 +2,8 @@ use crate::core::commands::ProtocolError;
 use crate::core::commands::Request;
 use crate::core::commands::RequestOpcode;
 use crate::core::commands::Response;
-use crate::core::config::Config;
+use crate::config::config::Config;
+use crate::core::commands::SocketStatus;
 use crate::core::router::ReservedRoutes;
 use crate::core::router::Router;
 use crate::protocol::framer::Framer;
@@ -10,6 +11,8 @@ use bytes::Bytes;
 use futures_util::FutureExt;
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
+use tokio::io::AsyncRead;
+use tokio::io::AsyncWrite;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use std::panic;
@@ -19,7 +22,6 @@ use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use tokio::net::TcpStream;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::watch;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -27,34 +29,18 @@ use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-#[derive(Debug, Clone, Copy)]
-pub enum SocketStatus {
-    Fresh,
-    Once,
-    Channel(u32),
-}
 
-impl SocketStatus {
-    fn to_u64(self) -> u64 {
-        match self {
-            SocketStatus::Fresh => 0,
-            SocketStatus::Once => 1_u64 << 32,
-            SocketStatus::Channel(id) => (2_u64 << 32) | u64::from(id),
-        }
-    }
+pub trait AsyncConnection:
+    AsyncRead + AsyncWrite + Unpin + Send + 'static
+{}
 
-    fn from_u64(value: u64) -> Self {
-        match value >> 32 {
-            0 => SocketStatus::Fresh,
-            1 => SocketStatus::Once,
-            2 => SocketStatus::Channel(value as u32),
-            _ => SocketStatus::Fresh,
-        }
-    }
-}
+impl<T> AsyncConnection for T
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{}
 
-pub async fn serve_connection<F, T>(
-    socket: TcpStream,
+pub async fn serve_connection<S, F, T>(
+    socket: S,
     router: Arc<Router>,
     mut config_receiver: watch::Receiver<Config>,
     semaphore: Arc<Semaphore>,
@@ -64,8 +50,9 @@ pub async fn serve_connection<F, T>(
     on_channel_connect: F,
     on_channel_disconnect: T
 ) where
+    S: AsyncConnection,
     F: Fn() -> Result<(SocketStatus, mpsc::Receiver<Response>), String> + Send + Sync + 'static,
-    T: Fn(u32) -> Result<(), String> + Send + Sync + 'static
+    T: Fn(u32) -> Result<(), String> + Send + Sync + 'static,
 {
     let mut config = config_receiver.borrow_and_update().clone();
 
@@ -451,11 +438,14 @@ where
     None
 }
 
-fn writer(
-    mut sink: SplitSink<Framed<TcpStream, Framer>, Response>,
+fn writer<S>(
+    mut sink: SplitSink<Framed<S, Framer>, Response>,
     mut rx: Receiver<Response>,
     max_batch: u32,
-) -> tokio::task::JoinHandle<()> {
+) -> tokio::task::JoinHandle<()> 
+where 
+    S: AsyncConnection
+{
     tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
             if let Err(e) = sink.feed(frame).await {

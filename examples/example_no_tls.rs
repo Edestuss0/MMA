@@ -1,7 +1,8 @@
 use MMA::core::commands::{Request, Response, ResponseOpcode};
-use MMA::core::config::{BigBytesConfig, Config, FramerConfig};
+use MMA::config::config::{BigBytesConfig, Config, FramerConfig};
+use MMA::core::handle::ServerHandle;
 use MMA::core::router::{Router};
-use MMA::core::server::{Server, ServerHandle};
+use MMA::core::server::{Server};
 use bytes::{Bytes};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
@@ -29,6 +30,10 @@ async fn main() {
         drain_timeout: Duration::from_secs(2),
         shutdown_grace: Duration::from_secs(10),
         request_timeout: Duration::from_secs(10),
+        tls_certificate_path: None,
+        tls_key_path: None,
+        tls_enable: false,
+        tls_handshake_timeout: None
     };
 
     let mut router = Router::new();
@@ -130,6 +135,10 @@ async fn change(_req: Request, res: Response, handle: ServerHandle) -> Response 
         drain_timeout: Duration::from_secs(2),
         shutdown_grace: Duration::from_secs(10),
         request_timeout: Duration::from_secs(10),
+        tls_certificate_path: None,
+        tls_key_path: None,
+        tls_enable: false,
+        tls_handshake_timeout: None
     };
     let _ = handle.change_config(config);
     res

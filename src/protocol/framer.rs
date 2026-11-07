@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock};
 pub(crate) use crate::core::commands::{
     ProtocolError, Request, RequestHeaders, RequestOpcode, Response, ResponseHeaders,
 };
-use crate::core::config::{self, BigBytesConfig, FramerConfig, RESERVED_SUFFIX};
+use crate::config::config::{self, BigBytesConfig, FramerConfig, RESERVED_SUFFIX};
 use ahash::AHashSet;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};

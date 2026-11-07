@@ -1,5 +1,5 @@
 use crate::core::commands::{Request, Response, ResponseHeaders, ResponseOpcode};
-use crate::core::config::MMA_VERSION;
+use crate::config::config::MMA_VERSION;
 use crate::core::router::RouteError::{Duplicate, InvalidName};
 use ahash::AHashMap;
 use bytes::Bytes;

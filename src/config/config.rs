@@ -3,7 +3,8 @@ use std::{
     time::Duration,
 };
 
-use crate::core::config::ConfigError::{MaxBatch, MaxConnections, MaxInFlight, Port};
+use crate::config::config::ConfigError::{MaxBatch, MaxConnections, MaxInFlight, Port};
+
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -15,6 +16,10 @@ pub struct Config {
     pub drain_timeout: Duration,
     pub shutdown_grace: Duration,
     pub request_timeout: Duration,
+    pub tls_certificate_path: Option<String>,
+    pub tls_key_path: Option<String>,
+    pub tls_enable: bool,
+    pub tls_handshake_timeout: Option<Duration>
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -42,6 +47,10 @@ impl Default for Config {
             drain_timeout: Duration::from_secs(2),
             shutdown_grace: Duration::from_secs(10),
             request_timeout: Duration::from_secs(10),
+            tls_certificate_path: None,
+            tls_key_path: None,
+            tls_enable: false,
+            tls_handshake_timeout: None
         }
     }
 }

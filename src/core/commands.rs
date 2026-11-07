@@ -2,9 +2,9 @@ use crate::core::{
     commands::ResponseOpcode::{
         BadRequest, ChannelConnected, ChannelMessage, Conflict, Forbidden, InternalError, NotFound,
         Ok, Shutdown, Timeout, Unauthorized,
-    },
-    config::MMA_VERSION,
+    }
 };
+use crate::config::config::MMA_VERSION;
 use bytes::Bytes;
 use std::io;
 use thiserror::Error;
@@ -231,6 +231,33 @@ impl Response {
             },
             payload: Bytes::from("Timeout error"),
             options: vec![],
+        }
+    }
+}
+
+
+#[derive(Debug, Clone, Copy)]
+pub enum SocketStatus {
+    Fresh,
+    Once,
+    Channel(u32),
+}
+
+impl SocketStatus {
+    pub fn to_u64(self) -> u64 {
+        match self {
+            SocketStatus::Fresh => 0,
+            SocketStatus::Once => 1_u64 << 32,
+            SocketStatus::Channel(id) => (2_u64 << 32) | u64::from(id),
+        }
+    }
+
+    pub fn from_u64(value: u64) -> Self {
+        match value >> 32 {
+            0 => SocketStatus::Fresh,
+            1 => SocketStatus::Once,
+            2 => SocketStatus::Channel(value as u32),
+            _ => SocketStatus::Fresh,
         }
     }
 }

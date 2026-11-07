@@ -1,9 +1,10 @@
 #![allow(non_camel_case_types)]
 
 use crate::core::commands::{Request, Response, ResponseOpcode};
-use crate::core::config::{BigBytesConfig, Config, FramerConfig};
+use crate::config::config::{BigBytesConfig, Config, FramerConfig};
+use crate::core::handle::ServerHandle;
 use crate::core::router::Router;
-use crate::core::server::{Server, ServerHandle};
+use crate::core::server::{Server};
 use bytes::Bytes;
 use std::ffi::{c_char, c_void, CStr};
 use std::net::{IpAddr, SocketAddr};
@@ -65,6 +66,10 @@ pub struct MMA_ServerConfig {
     pub shutdown_grace_ms: u64,
     /// Maximum time allowed for handling one request, in milliseconds.
     pub request_timeout_ms: u64,
+    pub tls_certificate_path: *const c_char,
+    pub tls_key_path: *const c_char,
+    pub tls_enable: bool,
+    pub tls_handshake_timeout: *const u64
 }
 
 #[repr(C)]
@@ -189,6 +194,39 @@ fn config_from_c(config: &MMA_ServerConfig) -> Option<Config> {
     let ip_str = unsafe { CStr::from_ptr(config.bind_ip) }.to_str().ok()?;
     let ip_addr = IpAddr::from_str(ip_str).ok()?;
 
+    let cert_path = if config.tls_certificate_path.is_null() {
+        None
+    } else {
+        let c_str = unsafe {CStr::from_ptr(config.tls_certificate_path)};
+        match c_str.to_str().map(|s| s.to_owned()) {
+            Ok(c) => Some(c),
+            Err(_) => {
+                return None;
+            }
+        }
+    };
+
+    let key_path = if config.tls_key_path.is_null() {
+        None
+    } else {
+        let c_str = unsafe {CStr::from_ptr(config.tls_key_path)};
+        match c_str.to_str().map(|s| s.to_owned()) {
+            Ok(c) => Some(c),
+            Err(_) => {
+                return None;
+            }
+        }
+    };
+
+    let tls_duration = if config.tls_handshake_timeout.is_null() {
+        None
+    } else {
+        match unsafe {config.tls_handshake_timeout.as_ref().copied()} {
+            Some(s) => Some(Duration::from_millis(s)),
+            None => None
+        }
+    };
+
     Some(Config {
         address: SocketAddr::new(ip_addr, config.port),
         frame_config: framer_config_from_c(config.framer)?,
@@ -198,6 +236,10 @@ fn config_from_c(config: &MMA_ServerConfig) -> Option<Config> {
         drain_timeout: Duration::from_millis(config.drain_timeout_ms),
         shutdown_grace: Duration::from_millis(config.shutdown_grace_ms),
         request_timeout: Duration::from_millis(config.request_timeout_ms),
+        tls_certificate_path: cert_path,
+        tls_key_path: key_path,
+        tls_enable: config.tls_enable,
+        tls_handshake_timeout: tls_duration,
     })
 }
 
@@ -534,6 +576,10 @@ pub unsafe extern "C" fn mma_server_config_default(
         drain_timeout_ms: 2_000,
         shutdown_grace_ms: 10_000,
         request_timeout_ms: 10_000,
+        tls_certificate_path: ptr::null(),
+        tls_key_path: ptr::null(),
+        tls_handshake_timeout: ptr::null(),
+        tls_enable: false,
     };
 
     // SAFETY: output was checked for null; caller must provide writable storage.

@@ -14,7 +14,48 @@ Every entry states its impact on the three compatibility surfaces separately (se
 
 ## [Unreleased]
 
-Changes since `v0.1.3` (commit `95a5abb`). Suggested version: **0.2.0** — the Rust push API is incompatible with 0.1.x, and `MMA_VERSION` stays `1` (frame layout and request semantics are unchanged by these edits).
+Changes since `v0.1.4` (commit `b6b8579`). Suggested version: **0.2.0** — module paths and `Config` changed (Rust), and `MMA_ServerConfig` changed its size (C ABI). `MMA_VERSION` stays `1`: the frame layout and request semantics are unchanged; TLS wraps the unchanged byte stream.
+
+### Added
+
+- **TLS (server side)** on top of `tokio-rustls` 0.26 / rustls, without client certificates. *Rust, ABI*
+  - `Config` has four new fields: `tls_enable: bool`, `tls_certificate_path: Option<String>`, `tls_key_path: Option<String>`, `tls_handshake_timeout: Option<Duration>`. All four defaults are off/`None`.
+  - `MMA_ServerConfig` has four new fields at the end: `tls_certificate_path`, `tls_key_path` (`const char *`), `tls_enable` (`bool`, one byte) and `tls_handshake_timeout` (`const uint64_t *`, milliseconds; `NULL` = none). The size grows from 64 to 96 bytes on x86-64.
+  - A connection that fails the handshake, or does not finish it within `tls_handshake_timeout`, is dropped and logged.
+  - `ServerHandle::change_config` (and `mma_server_handle_change_config`) refuses a change of any TLS field: `InvalidInput` in Rust, `MMA_SERVER_ERROR` in C.
+- `examples/example_with_tls.rs` (takes the certificate and key paths as arguments) and `examples/example_no_tls.rs`; `example_certs/` with a local test CA and a server certificate for `localhost`, `127.0.0.1` and `::1` (valid until 2027-11-07).
+- `mma_gui_client.py` has a TLS section (transport security, certificate check, server name).
+
+### Changed
+
+- **Rust API (breaking).**
+  - `Config`, `FramerConfig`, `BigBytesConfig`, `ConfigError` and `MMA_VERSION` moved from `MMA::core::config` to `MMA::config::config`.
+  - `ServerHandle` moved from `core::server` to `core::handle`. `ChannelHub` is now private (`pub(crate)` module); it was reachable through `core::server` in 0.1.4.
+  - `SocketStatus` moved from the private network module to `core::commands` and is public.
+  - `Config` has four new fields, so struct literals without `..Config::default()` no longer compile.
+  - `examples/main_server.rs` is replaced by `no_tls` and `with_tls`; `cargo run --example main_server` no longer works.
+- `serve_connection` is generic over the stream (`AsyncConnection`: `AsyncRead + AsyncWrite + Unpin + Send`), so TLS and plain TCP share one code path. Internal.
+- README: TLS, new module paths, the 96-byte `MMA_ServerConfig`, SIGPIPE rule, duplicate-route behaviour of the C API. The earlier statement that `FramerConfig::new()` exists was wrong; the constructor is `FramerConfig::default()` (`BigBytesConfig::new()` exists).
+
+### Known issues
+
+Verified by running the code (`cargo build --release`, `cargo test --locked --all-targets`: 14 tests pass; live sessions against `examples/with_tls`, `examples/no_tls` and a C program covering all 20 exported functions).
+
+1. **A TLS error turns TLS off silently.** If `tls_enable` is `true` but the certificate or key cannot be loaded, `Server::new`/`from_listener` and `mma_server_create` + `mma_server_start` succeed, print `Invalid TLS config: …` to stderr and serve **plain TCP**. The same happens when `tls_enable` is `true` but a path or `tls_handshake_timeout` is missing. Observed: a plain client got normal answers from a server started with `/nonexistent.crt`. Suggested fix: return an error from `from_listener` and from `mma_server_create`.
+2. **`include/mma.h` does not contain the new `MMA_ServerConfig` fields.** The header in the tree still describes the 64-byte struct while the library writes and reads 96 bytes. Observed: `mma_server_config_default` overwrote 32 bytes after the caller's struct (stack corruption), and `mma_server_create` reads the missing fields from whatever follows. `examples/main_server.c`, the CI C-example build and any C code built against this header are affected; the CI cannot see it, because it compiles against the same stale header. A corrected header (`uint8_t tls_enable`, new comment) is provided with this change.
+3. **C hosts are killed by `SIGPIPE`.** Writing to a socket whose peer has closed raises `SIGPIPE`; a C host does not ignore it (a Rust binary does). Observed: the host process exited with status 13 when a client with a full push queue disconnected. Workaround: `signal(SIGPIPE, SIG_IGN)` before `mma_server_start`. Suggested fix: ignore the signal inside the library or send with `MSG_NOSIGNAL`.
+4. In the C API a duplicate route passes `mma_server_register_route` (returns `MMA_OK`) and fails only at `mma_server_start` with `MMA_SERVER_ERROR`; the reason goes to stderr.
+5. `Config::validate` ignores the TLS fields.
+6. The header comment said callbacks run "on runtime worker threads"; they run on Tokio's blocking pool (corrected in the provided header).
+7. No automated tests cover TLS, `ChannelHub`, the lifecycle hooks or the C ABI.
+8. Files that exist next to the sources but are not in git: `mma_gui_client.py` (the README and the 0.1.3 entry mention it) and `MMA_Audit_RU.md`. `example_certs/` contains private keys (`ca/ca.key`, `server/server.key`); they are throw-away test keys, but a CA key in a public repository is still a bad habit and the `.gitignore` does not exclude it.
+9. The earlier 0.1.3 and 0.1.4 known issues that remain: the user's disconnect hook does not run when a TCP connection is dropped; `send_to_channel(0, ..)` is blocked by one non-reading client; no per-connection in-flight cap.
+10. Compiler warnings: crate name `MMA` is not snake case, `ReservedRoutes` variants are upper case, two unused imports.
+11. Source files use CRLF line endings; `.gitattributes` with `* text=auto eol=lf` is provided.
+
+## [0.1.4] - 2026-11-07
+
+Tag `v0.1.4` (commit `b6b8579`). Changes since `v0.1.3` (commit `95a5abb`). `MMA_VERSION` stays `1`; `Cargo.toml` still says `0.1.0`.
 
 ### Changed
 
@@ -97,5 +138,6 @@ Items 1 and 2 are fixed in *Unreleased* above; item 3 is still open.
 5. Hooks and the reserved-route checks have no automated tests. Verified manually: `cargo build --release`, `cargo test` (14 tests pass, unchanged), the C example compiles against the new header, all 20 `mma_*` functions of the header are exported, and a live session against `examples/main_server` (wrong route → `BadRequest`; connect hook → push `Connect: …`; second connect → `Conflict`; disconnect → hook push, `NotFound`, close after ≈ 4 s with `drain_timeout` 2 s; `CHANNEL_DISCONNECT` on a fresh connection → `BadRequest`).
 6. Line endings: 18 files in the working tree use CRLF (a content-free change against the commit). Add a `.gitattributes` (`* text=auto eol=lf`) before committing so the diff stays readable.
 
-[Unreleased]: https://github.com/Edestuss0/MMA-Network-protocol/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/Edestuss0/MMA-Network-protocol/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/Edestuss0/MMA-Network-protocol/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/Edestuss0/MMA-Network-protocol/compare/432905c...v0.1.3

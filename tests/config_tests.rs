@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use MMA::core::config::{BigBytesConfig, Config, FramerConfig, MIN_HEADER_LEN, RESERVED_SUFFIX};
+use MMA::config::config::{BigBytesConfig, Config, FramerConfig, MIN_HEADER_LEN, RESERVED_SUFFIX};
 
 fn valid_config() -> Config {
     Config::default()

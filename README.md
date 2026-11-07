@@ -91,8 +91,8 @@ bytes = "1"
 ```
 
 ```rust
-use MMA::core::{commands::{Request, Response}, config::Config,
-                router::Router, server::Server};
+use MMA::config::config::Config;
+use MMA::core::{commands::{Request, Response}, router::Router, server::Server};
 use bytes::Bytes;
 
 async fn upper(req: Request, mut res: Response) -> Response {
@@ -109,7 +109,7 @@ async fn main() -> std::io::Result<()> {
 }
 ```
 
-Run the bundled example: `cargo run --example main_server`.
+Bundled examples: `cargo run --example no_tls` and, with TLS, `cargo run --example with_tls -- example_certs/server/server.crt example_certs/server/server.key` (both listen on `0.0.0.0:8080`; the certificates are for local tests only).
 
 ### Minimal client (Python, default layout)
 
@@ -267,7 +267,7 @@ Response `Ok` — 34 bytes:
 01 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 05 00 00 00 01 68 65 6c 6c 6f
 ```
 
-The same logical request under another configuration (for example `version_pos=4`, `route_len_pos=6`, `options_count_pos=7`, order payload → options → route, as in `examples/main_server.rs`) produces entirely different bytes. That is the point of the design.
+The same logical request under another configuration (for example `version_pos=4`, `route_len_pos=6`, `options_count_pos=7`, order payload → options → route, as in `examples/example_no_tls.rs`) produces entirely different bytes. That is the point of the design.
 
 ### 3.6. Layout configuration
 
@@ -440,35 +440,39 @@ Behaviour:
 
 ## 7. Rust API
 
-Public modules: `MMA::core::{commands, config, router, server}` and `MMA::c_api`. The framer and network layers are private. The crate builds as `rlib`, `cdylib` and `staticlib`.
+Public modules: `MMA::config::config` (`Config`, `FramerConfig`, `BigBytesConfig`), `MMA::core::{commands, router, server, handle}` and `MMA::c_api`. The channel table and the TLS acceptor are private. The framer and network layers are private. The crate builds as `rlib`, `cdylib` and `staticlib`.
 
 ### 7.1. Types
 
 | Type | Role |
 |---|---|
 | `Config` | server settings (`Clone`, `Debug`); `Config::default()`, `validate()` |
-| `FramerConfig` | wire layout; `FramerConfig::new()` / `Default`, `validate()` |
+| `FramerConfig` | wire layout; `FramerConfig::default()`, `validate()` |
 | `Request` | `headers`, `payload: Bytes`, `route: String`, `options: Vec<(Bytes, Bytes)>` |
 | `Response` | `headers`, `payload: Bytes`, `options`; created with `Response::new(req_id)` |
 | `Router` | route table |
 | `Server` | owns the listener; `run`, `run_until` |
-| `ServerHandle` | cheap `Clone`, `Send + Sync`; sends channel messages |
+| `ServerHandle` (`core::handle`) | cheap `Clone`, `Send + Sync`; sends channel messages, changes the configuration |
 
 ### 7.2. Configuration
 
 ```rust
-use MMA::core::config::{Config, FramerConfig};
+use MMA::config::config::{Config, FramerConfig};
 use std::{net::SocketAddr, time::Duration};
 
 let config = Config {
     address: SocketAddr::from(([0, 0, 0, 0], 8080)),
-    frame_config: FramerConfig::new(),
+    frame_config: FramerConfig::default(),
     max_batch: 255,
     max_in_flight: 1024,
     max_connections: 128_000,
     drain_timeout: Duration::from_secs(2),
     shutdown_grace: Duration::from_secs(10),
     request_timeout: Duration::from_secs(10),
+    tls_enable: false,
+    tls_certificate_path: None,
+    tls_key_path: None,
+    tls_handshake_timeout: None,
 };
 config.validate().expect("invalid config");
 ```
@@ -481,9 +485,30 @@ config.validate().expect("invalid config");
 | `max_message_length` (in `FramerConfig`) | 10 000 000 | maximum body size in bytes |
 | `request_timeout` | 10 s | handler time limit |
 | `drain_timeout` | 2 s | time to flush pending responses when a connection closes |
+| `tls_enable`, `tls_certificate_path`, `tls_key_path`, `tls_handshake_timeout` | off / `None` | TLS, see below |
 | `shutdown_grace` | 10 s | time to wait for running tasks on shutdown before forced cancellation |
 
-`Config::validate` rejects zero limits, an invalid `FramerConfig` and **port 0**.
+`Config::validate` rejects zero limits, an invalid `FramerConfig` and **port 0**. It does not look at the TLS fields.
+
+#### TLS
+
+MMA can terminate TLS itself (rustls, no client certificates). Set all four fields:
+
+```rust
+let config = Config {
+    tls_enable: true,
+    tls_certificate_path: Some("server.crt".into()),   // PEM chain
+    tls_key_path: Some("server.key".into()),           // PEM private key
+    tls_handshake_timeout: Some(Duration::from_secs(10)),
+    ..Config::default()
+};
+```
+
+- TLS is on only if `tls_enable` is `true` **and** the certificate path, the key path and the handshake timeout are all set. If any of them is missing, the server runs **without TLS and without an error**.
+- **If the certificate or the key cannot be loaded, `Server::new` still succeeds, prints `Invalid TLS config: …` to stderr and serves plain TCP.** Check the log, or test with a TLS client after start. Do not rely on this configuration to be encrypted without checking.
+- With TLS on, a plain-text client is rejected during the handshake (`TLS Handshake failed`); a handshake that takes longer than `tls_handshake_timeout` is dropped.
+- The frame protocol runs unchanged inside the TLS stream. A client must verify the server certificate and name itself (the example uses `example_certs/ca/ca.crt` and the name `localhost`).
+- TLS settings cannot change while the server runs: `ServerHandle::change_config` returns `InvalidInput` ("TLS settings cannot be changed while server is running") if any TLS field differs.
 
 ### 7.3. Handlers
 
@@ -568,6 +593,7 @@ Do not block inside handlers: `request_timeout` cannot cancel blocking code, and
 | `Server::new(config).await` | validates the config and binds the listener |
 | `Server::from_listener(config, listener)` | uses an existing listener (the config is still validated, so port 0 is rejected) |
 | `server.handle()` | returns a `ServerHandle` |
+| `handle.change_config(config)` | validates and publishes a new configuration; TLS fields must stay the same; `Err(io::Error)` otherwise |
 | `server.run(router).await` | serves until Ctrl+C, then shuts down gracefully |
 | `server.run_until(router, fut).await` | serves until `fut` completes |
 | `server.shutdown_token()` / `shutdown_server()` | cancellation token / trigger shutdown |
@@ -596,9 +622,9 @@ Header: [`include/mma.h`](include/mma.h). Prebuilt packages are attached to each
 
 | Function | Purpose | Notes |
 |---|---|---|
-| `mma_server_config_default` | fill `MMA_ServerConfig` with defaults | `bind_ip` points to a static `"0.0.0.0"` |
-| `mma_server_create` | validate the config, create a server (no bind yet) | free with `mma_server_destroy` |
-| `mma_server_register_route` | register a request/response handler | before `start`; the route is copied |
+| `mma_server_config_default` | fill `MMA_ServerConfig` with defaults | `bind_ip` points to a static `"0.0.0.0"`; TLS off, pointers `NULL` |
+| `mma_server_create` | validate the config, create a server (no bind yet) | free with `mma_server_destroy`; copies the strings it needs |
+| `mma_server_register_route` | register a request/response handler | before `start`; the route is copied. A **duplicate** route is not detected here: `mma_server_start` fails with `MMA_SERVER_ERROR` and prints the reason to stderr. An empty route or a `NULL` server returns an error at once |
 | `mma_server_register_channel_handler` | register a channel handler | before `start` |
 | `mma_server_register_on_channel_connect_handler` | register the global connect hook | before `start`; one hook, a repeated call replaces it |
 | `mma_server_register_on_channel_disconnect_handler` | register the global disconnect hook | before `start`; one hook, a repeated call replaces it |
@@ -607,7 +633,7 @@ Header: [`include/mma.h`](include/mma.h). Prebuilt packages are attached to each
 | `mma_server_local_port` | return the port | call after `start` |
 | `mma_server_get_handle` | get a server handle (clone of `ServerHandle`) | after `start`; free with `mma_server_handle_destroy` |
 | `mma_server_handle_send_to_channel` | push a response to channels without waiting | `conn_id == 0` broadcasts; returns `MMA_SERVER_ERROR` if the target is unknown, its queue (256) is full, or a broadcast was only partly accepted |
-| `mma_server_handle_change_config` | send a new configuration to the running server | not all fields apply at runtime |
+| `mma_server_handle_change_config` | send a new configuration to the running server | not all fields apply at runtime; returns `MMA_INVALID_CONFIG` for an invalid config and `MMA_SERVER_ERROR` if a TLS field differs |
 | `mma_server_handle_destroy` | free the handle | does not stop the server |
 | `mma_server_stop` | cancel and join the server thread | never call from a callback of the same server |
 | `mma_server_destroy` | free the server (calls `stop`) | `NULL` is allowed |
@@ -615,6 +641,21 @@ Header: [`include/mma.h`](include/mma.h). Prebuilt packages are attached to each
 | `mma_response_set_status` | set the response opcode | returns the response; `inner == NULL` on error |
 | `mma_response_set_payload` | set the payload (copied) | |
 | `mma_response_add_option` | add an option (copied) | non-empty key/value, ≤ 65535 bytes, ≤ 255 options |
+
+`MMA_ServerConfig` ends with four TLS fields:
+
+```c
+typedef struct {
+    /* ... bind_ip, port, max_batch, max_in_flight, framer, max_connections,
+       drain_timeout_ms, shutdown_grace_ms, request_timeout_ms ... */
+    const char     *tls_certificate_path;   /* NULL = none */
+    const char     *tls_key_path;           /* NULL = none */
+    uint8_t         tls_enable;             /* 0 or 1 only */
+    const uint64_t *tls_handshake_timeout_ms; /* NULL = none; points to a value in ms */
+} MMA_ServerConfig;
+```
+
+The Rust side expects exactly this layout (96 bytes on x86-64). The header must contain these fields: a C program built against a header without them lets `mma_server_config_default` write 32 bytes past its `MMA_ServerConfig`. The same rules as for Rust apply: TLS is active only when `tls_enable` is 1 and all three other fields are set, and an unreadable certificate or key does not make `mma_server_start` fail (it serves plain TCP and prints `Invalid TLS config` to stderr).
 
 ### 8.2. Error codes
 
@@ -671,7 +712,7 @@ Rules:
 | Rust | C |
 |---|---|
 | `u8` / `u16` / `u32` / `u64` | `uint8_t` / `uint16_t` / `uint32_t` / `uint64_t` |
-| `bool` | `uint8_t` (0/1) |
+| `bool` | `uint8_t` (0 or 1 only) |
 | `Duration` | `uint64_t` milliseconds (`*_ms`) |
 | `SocketAddr` | `const char *bind_ip` + `uint16_t port` (port 0 rejected) |
 | `Bytes` | `const uint8_t *` + `size_t` (borrowed) |
@@ -685,6 +726,8 @@ Rules:
 - `create` → register routes → `start` → … → `stop` → `destroy`.
 - Do not call `start`, `stop` or `destroy` concurrently on the same pointer, and do not use a pointer after `destroy`. The library cannot detect double-free or use-after-free.
 - `mma_server_stop` makes the server thread exit and joins it. Dropping the runtime waits for C callbacks that are already running, so `stop` can take longer than `shutdown_grace` while a callback has not returned. A synchronous C function cannot be interrupted.
+- The strings in `MMA_ServerConfig` (`bind_ip`, TLS paths) and the value behind `tls_handshake_timeout_ms` are read and copied inside `mma_server_create` and `mma_server_handle_change_config`; they may be freed afterwards.
+- **Ignore `SIGPIPE` in a C host** (`signal(SIGPIPE, SIG_IGN)`) before starting the server. The library writes to sockets with the ordinary `write`; when a client closes a connection while the server is still sending, the default action of `SIGPIPE` kills the whole process. Rust programs are not affected, because the Rust runtime ignores the signal. Observed: a C host died with exit status 13 when a client with a full push queue disconnected.
 - `mma_server_handle_change_config`: new `FramerConfig` and `request_timeout` are picked up by connections; `max_batch`, `max_connections`, `max_in_flight`, the listen address and `shutdown_grace` are **not** updated. Changing wire parameters without switching clients at the same time breaks parsing.
 
 ### 8.7. Example
@@ -713,8 +756,8 @@ Three versions are independent:
 | What | Now | Rule |
 |---|---|---|
 | Wire protocol | `MMA_VERSION = 1` | bumped on incompatible frame or semantics changes |
-| Rust crate | `0.1.0` in `Cargo.toml` (git tags go up to `v0.1.3`) | before 1.0, breaking changes may occur in any release; the push API changed (see [CHANGELOG.md](CHANGELOG.md)) |
-| C ABI / `mma.h` | unversioned | signatures unchanged since the lifecycle-hook functions were added; `mma_server_handle_send_to_channel` changed behaviour (non-waiting, per-channel queue); no runtime version query |
+| Rust crate | `0.1.0` in `Cargo.toml` (git tags go up to `v0.1.4`) | before 1.0, breaking changes may occur in any release; module paths and the push API changed (see [CHANGELOG.md](CHANGELOG.md)) |
+| C ABI / `mma.h` | unversioned | `MMA_ServerConfig` grew by four TLS fields at the end (32 bytes): recompile all C code against the new header; `mma_server_handle_send_to_channel` is non-waiting; no runtime version query |
 
 Two peers are wire-compatible only if `MMA_VERSION` **and** the whole `FramerConfig` match. Note: the reserved-route rule for `ChannelConnect` ([§5.5](#55-reserved-routes-and-connection-lifecycle-hooks)) changes request semantics without changing the frame layout or `MMA_VERSION`; see [CHANGELOG.md](CHANGELOG.md). Adding opcodes or a mandatory field requires a new `MMA_VERSION`; an old server closes the connection on an unknown request opcode.
 
@@ -722,7 +765,8 @@ Two peers are wire-compatible only if `MMA_VERSION` **and** the whole `FramerCon
 
 ## 10. Security
 
-- **No TLS, no authentication, no replay protection.** The layout configuration is obfuscation and is not a secret unless distributed as one. Terminate TLS in front of MMA (stunnel, a sidecar proxy) or use a trusted network.
+- **TLS is optional and server-side only** (see [§7.2](#72-configuration)); there is no client authentication, no application-level authentication and no replay protection. Without TLS everything, including the layout, is readable on the wire. The layout configuration is obfuscation and is not a secret unless distributed as one. A bad certificate or key silently turns TLS off (see §7.2): verify that a TLS handshake works after every deployment.
+- `example_certs/` holds a throw-away CA and server key for local tests. Never use them in production and do not publish your own private keys.
 - Treat every field from the client as untrusted. Only `route` is UTF-8-validated; payload and options are raw bytes.
 
 | Limit | Value |
@@ -745,10 +789,12 @@ Not covered yet: idle/read/write timeouts (slow-client attacks), a global byte b
 |---|---|
 | `src/protocol/framer.rs` | frame encoder/decoder (private) |
 | `src/network/network.rs` | per-connection loop, state machine (private) |
-| `src/core/` | `commands` (Request/Response), `config`, `router` (routes, handlers, lifecycle hooks), `server` |
+| `src/config/config.rs` | `Config`, `FramerConfig`, `BigBytesConfig`, `MMA_VERSION` |
+| `src/core/` | `commands` (Request/Response, `SocketStatus`), `router` (routes, handlers, lifecycle hooks), `server`, `handle` (`ServerHandle`), `channel_hub` and `tls` (private) |
 | `src/c_api.rs` | C ABI exports |
 | `include/mma.h` | C header |
-| `examples/main_server.rs`, `examples/main_server.c` | Rust and C server examples (the Rust one also shows the connect/disconnect hooks) |
+| `examples/example_no_tls.rs`, `examples/example_with_tls.rs`, `examples/main_server.c` | Rust servers without and with TLS (they also show the connect/disconnect hooks) and a C server |
+| `example_certs/` | test CA and server certificate for `example_with_tls.rs` (not for production) |
 | `mma_gui_client.py` | Tkinter test client (Python standard library): configurable layout, all three opcodes, a codec self-test |
 | `.github/workflows/native-release.yml` | CI on every push (Rust tests, C example compiled with `-Werror`, C++ header check); on `v*` tags it builds the native packages and publishes the Release |
 | `CHANGELOG.md` | history of changes with wire / Rust API / C ABI impact |

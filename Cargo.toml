@@ -15,7 +15,12 @@ futures-util = { version = "0.3", features = ["sink"] }
 ahash = "0.8.12"
 strum = "0.28.0"
 strum_macros = "0.28.0"
+tokio-rustls = "0.26.6"
 
 [[example]]
-name = "main_server"
-path = "examples/main_server.rs"
+name = "no_tls"
+path = "examples/example_no_tls.rs"
+
+[[example]]
+name = "with_tls"
+path = "examples/example_with_tls.rs"

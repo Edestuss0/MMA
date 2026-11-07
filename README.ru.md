@@ -8,7 +8,6 @@
 
 </div>
 
-> **Статус:** pre-release `0.1.0` · версия wire-протокола `1` · API и C ABI могут меняться без предупреждения. История изменений: [CHANGELOG.ru.md](CHANGELOG.ru.md).
 
 MMA — приватный бинарный протокол поверх TCP с режимами запрос/ответ и channel. Главная особенность: **единого фиксированного wire-формата нет.** Раскладка байтов кадра определяется конфигурацией (`FramerConfig`), общей для обеих сторон, поэтому два развёртывания с разными конфигурациями выглядят на проводе как два разных несовместимых протокола.
 
@@ -91,8 +90,8 @@ bytes = "1"
 ```
 
 ```rust
-use MMA::core::{commands::{Request, Response}, config::Config,
-                router::Router, server::Server};
+use MMA::config::config::Config;
+use MMA::core::{commands::{Request, Response}, router::Router, server::Server};
 use bytes::Bytes;
 
 async fn upper(req: Request, mut res: Response) -> Response {
@@ -109,7 +108,7 @@ async fn main() -> std::io::Result<()> {
 }
 ```
 
-Готовый пример: `cargo run --example main_server`.
+Готовые примеры: `cargo run --example no_tls` и, с TLS, `cargo run --example with_tls -- example_certs/server/server.crt example_certs/server/server.key` (оба слушают `0.0.0.0:8080`; сертификаты только для локальных тестов).
 
 ### Минимальный клиент (Python, раскладка по умолчанию)
 
@@ -267,7 +266,7 @@ frame_len = header_length + body_len                 (checked-сложение)
 01 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 05 00 00 00 01 68 65 6c 6c 6f
 ```
 
-Тот же логический запрос при другой конфигурации (например, `version_pos=4`, `route_len_pos=6`, `options_count_pos=7`, порядок payload → options → route, как в `examples/main_server.rs`) даст совершенно другие байты. В этом и состоит идея.
+Тот же логический запрос при другой конфигурации (например, `version_pos=4`, `route_len_pos=6`, `options_count_pos=7`, порядок payload → options → route, как в `examples/example_no_tls.rs`) даст совершенно другие байты. В этом и состоит идея.
 
 ### 3.6. Конфигурация раскладки
 
@@ -440,35 +439,39 @@ options_key_first = false:  [key_len u16 BE][value_len u16 BE][value][key]
 
 ## 7. Rust API
 
-Публичные модули: `MMA::core::{commands, config, router, server}` и `MMA::c_api`. Framer и сетевой слой приватны. Crate собирается как `rlib`, `cdylib` и `staticlib`.
+Публичные модули: `MMA::config::config` (`Config`, `FramerConfig`, `BigBytesConfig`), `MMA::core::{commands, router, server, handle}` и `MMA::c_api`. Таблица каналов и TLS-акцептор приватны. Framer и сетевой слой приватны. Crate собирается как `rlib`, `cdylib` и `staticlib`.
 
 ### 7.1. Типы
 
 | Тип | Роль |
 |---|---|
 | `Config` | настройки сервера (`Clone`, `Debug`); `Config::default()`, `validate()` |
-| `FramerConfig` | wire-раскладка; `FramerConfig::new()` / `Default`, `validate()` |
+| `FramerConfig` | wire-раскладка; `FramerConfig::default()`, `validate()` |
 | `Request` | `headers`, `payload: Bytes`, `route: String`, `options: Vec<(Bytes, Bytes)>` |
 | `Response` | `headers`, `payload: Bytes`, `options`; создаётся `Response::new(req_id)` |
 | `Router` | таблица маршрутов |
 | `Server` | владеет listener; `run`, `run_until` |
-| `ServerHandle` | дешёвый `Clone`, `Send + Sync`; отправляет channel-сообщения |
+| `ServerHandle` (`core::handle`) | дешёвый `Clone`, `Send + Sync`; отправляет channel-сообщения, меняет конфигурацию |
 
 ### 7.2. Конфигурация
 
 ```rust
-use MMA::core::config::{Config, FramerConfig};
+use MMA::config::config::{Config, FramerConfig};
 use std::{net::SocketAddr, time::Duration};
 
 let config = Config {
     address: SocketAddr::from(([0, 0, 0, 0], 8080)),
-    frame_config: FramerConfig::new(),
+    frame_config: FramerConfig::default(),
     max_batch: 255,
     max_in_flight: 1024,
     max_connections: 128_000,
     drain_timeout: Duration::from_secs(2),
     shutdown_grace: Duration::from_secs(10),
     request_timeout: Duration::from_secs(10),
+    tls_enable: false,
+    tls_certificate_path: None,
+    tls_key_path: None,
+    tls_handshake_timeout: None,
 };
 config.validate().expect("invalid config");
 ```
@@ -481,9 +484,30 @@ config.validate().expect("invalid config");
 | `max_message_length` (в `FramerConfig`) | 10 000 000 | максимальный размер тела в байтах |
 | `request_timeout` | 10 с | лимит времени обработчика |
 | `drain_timeout` | 2 с | время на отправку накопленных ответов при закрытии соединения |
+| `tls_enable`, `tls_certificate_path`, `tls_key_path`, `tls_handshake_timeout` | выкл. / `None` | TLS, см. ниже |
 | `shutdown_grace` | 10 с | ожидание выполняющихся задач при остановке до принудительной отмены |
 
-`Config::validate` отклоняет нулевые лимиты, неверный `FramerConfig` и **порт 0**.
+`Config::validate` отклоняет нулевые лимиты, неверный `FramerConfig` и **порт 0**. Поля TLS он не проверяет.
+
+#### TLS
+
+MMA может сам завершать TLS (rustls, без клиентских сертификатов). Задайте все четыре поля:
+
+```rust
+let config = Config {
+    tls_enable: true,
+    tls_certificate_path: Some("server.crt".into()),   // цепочка PEM
+    tls_key_path: Some("server.key".into()),           // приватный ключ PEM
+    tls_handshake_timeout: Some(Duration::from_secs(10)),
+    ..Config::default()
+};
+```
+
+- TLS включён, только если `tls_enable` равно `true` **и** заданы путь к сертификату, путь к ключу и таймаут рукопожатия. Если чего-то не хватает, сервер работает **без TLS и без ошибки**.
+- **Если сертификат или ключ не удалось загрузить, `Server::new` всё равно возвращает успех, пишет в stderr `Invalid TLS config: …` и работает по обычному TCP.** Смотрите лог или проверяйте TLS-клиентом после запуска. Не считайте такое соединение зашифрованным, не проверив.
+- При включённом TLS клиент без шифрования отклоняется на рукопожатии (`TLS Handshake failed`); рукопожатие дольше `tls_handshake_timeout` обрывается.
+- Кадровый протокол внутри TLS-потока не меняется. Клиент сам проверяет сертификат и имя сервера (пример использует `example_certs/ca/ca.crt` и имя `localhost`).
+- Настройки TLS нельзя менять на работающем сервере: `ServerHandle::change_config` вернёт `InvalidInput` («TLS settings cannot be changed while server is running»), если любое поле TLS отличается.
 
 ### 7.3. Обработчики
 
@@ -568,6 +592,7 @@ router.register_on_channel_disconnect_handler(|req: Request, conn_id: u32| async
 | `Server::new(config).await` | проверяет конфигурацию и привязывает listener |
 | `Server::from_listener(config, listener)` | использует готовый listener (конфигурация всё равно проверяется, порт 0 отклоняется) |
 | `server.handle()` | возвращает `ServerHandle` |
+| `handle.change_config(config)` | проверяет и публикует новую конфигурацию; поля TLS должны остаться прежними, иначе `Err(io::Error)` |
 | `server.run(router).await` | работает до Ctrl+C, затем graceful shutdown |
 | `server.run_until(router, fut).await` | работает, пока не завершится `fut` |
 | `server.shutdown_token()` / `shutdown_server()` | токен отмены / запуск остановки |
@@ -596,9 +621,9 @@ router.register_on_channel_disconnect_handler(|req: Request, conn_id: u32| async
 
 | Функция | Назначение | Примечания |
 |---|---|---|
-| `mma_server_config_default` | заполняет `MMA_ServerConfig` значениями по умолчанию | `bind_ip` указывает на статическую `"0.0.0.0"` |
-| `mma_server_create` | проверяет конфигурацию, создаёт сервер (bind ещё нет) | освобождать `mma_server_destroy` |
-| `mma_server_register_route` | регистрирует обработчик запрос/ответ | до `start`; route копируется |
+| `mma_server_config_default` | заполняет `MMA_ServerConfig` значениями по умолчанию | `bind_ip` указывает на статическую `"0.0.0.0"`; TLS выключен, указатели `NULL` |
+| `mma_server_create` | проверяет конфигурацию, создаёт сервер (bind ещё нет) | освобождать `mma_server_destroy`; копирует нужные ему строки |
+| `mma_server_register_route` | регистрирует обработчик запрос/ответ | до `start`; route копируется. **Дубликат** route здесь не обнаруживается: `mma_server_start` вернёт `MMA_SERVER_ERROR` и напечатает причину в stderr. Пустой route и `NULL`-сервер дают ошибку сразу |
 | `mma_server_register_channel_handler` | регистрирует channel-обработчик | до `start` |
 | `mma_server_register_on_channel_connect_handler` | регистрирует глобальный connect-хук | до `start`; один хук, повторный вызов заменяет его |
 | `mma_server_register_on_channel_disconnect_handler` | регистрирует глобальный disconnect-хук | до `start`; один хук, повторный вызов заменяет его |
@@ -607,7 +632,7 @@ router.register_on_channel_disconnect_handler(|req: Request, conn_id: u32| async
 | `mma_server_local_port` | возвращает порт | вызывать после `start` |
 | `mma_server_get_handle` | получает handle сервера (клон `ServerHandle`) | после `start`; освобождать `mma_server_handle_destroy` |
 | `mma_server_handle_send_to_channel` | отправляет response в каналы без ожидания | `conn_id == 0` — рассылка всем; `MMA_SERVER_ERROR`, если получатель неизвестен, его очередь (256) полна или рассылка принята частично |
-| `mma_server_handle_change_config` | отправляет новую конфигурацию работающему серверу | не все поля применяются на лету |
+| `mma_server_handle_change_config` | отправляет новую конфигурацию работающему серверу | не все поля применяются на лету; для неверной конфигурации — `MMA_INVALID_CONFIG`, при отличии поля TLS — `MMA_SERVER_ERROR` |
 | `mma_server_handle_destroy` | освобождает handle | сервер не останавливает |
 | `mma_server_stop` | отменяет работу и ждёт поток сервера | не вызывать из callback этого же сервера |
 | `mma_server_destroy` | освобождает сервер (внутри вызывает `stop`) | `NULL` допустим |
@@ -615,6 +640,21 @@ router.register_on_channel_disconnect_handler(|req: Request, conn_id: u32| async
 | `mma_response_set_status` | задаёт opcode ответа | возвращает response; `inner == NULL` при ошибке |
 | `mma_response_set_payload` | задаёт payload (копируется) | |
 | `mma_response_add_option` | добавляет option (копируется) | key/value непустые, ≤ 65535 байт, ≤ 255 options |
+
+`MMA_ServerConfig` заканчивается четырьмя полями TLS:
+
+```c
+typedef struct {
+    /* ... bind_ip, port, max_batch, max_in_flight, framer, max_connections,
+       drain_timeout_ms, shutdown_grace_ms, request_timeout_ms ... */
+    const char     *tls_certificate_path;   /* NULL = нет */
+    const char     *tls_key_path;           /* NULL = нет */
+    uint8_t         tls_enable;             /* только 0 или 1 */
+    const uint64_t *tls_handshake_timeout_ms; /* NULL = нет; указывает на значение в мс */
+} MMA_ServerConfig;
+```
+
+Rust-сторона ожидает именно такую раскладку (96 байт на x86-64). В заголовке эти поля обязаны быть: C-программа, собранная с заголовком без них, позволит `mma_server_config_default` записать 32 байта за пределами своей `MMA_ServerConfig`. Правила те же, что в Rust: TLS активен, только когда `tls_enable` равно 1 и заданы остальные три поля, а нечитаемый сертификат или ключ не приводят к ошибке `mma_server_start` (сервер работает по обычному TCP и печатает `Invalid TLS config` в stderr).
 
 ### 8.2. Коды ошибок
 
@@ -671,7 +711,7 @@ Route-callback — **функциональный**: получает пусто
 | Rust | C |
 |---|---|
 | `u8` / `u16` / `u32` / `u64` | `uint8_t` / `uint16_t` / `uint32_t` / `uint64_t` |
-| `bool` | `uint8_t` (0/1) |
+| `bool` | `uint8_t` (только 0 или 1) |
 | `Duration` | `uint64_t`, миллисекунды (`*_ms`) |
 | `SocketAddr` | `const char *bind_ip` + `uint16_t port` (порт 0 отклоняется) |
 | `Bytes` | `const uint8_t *` + `size_t` (заимствование) |
@@ -685,6 +725,8 @@ Route-callback — **функциональный**: получает пусто
 - `create` → регистрация маршрутов → `start` → … → `stop` → `destroy`.
 - Не вызывайте `start`, `stop`, `destroy` конкурентно для одного указателя и не используйте указатель после `destroy`. Библиотека не обнаруживает double-free и use-after-free.
 - `mma_server_stop` завершает поток сервера и ждёт его. При уничтожении runtime дожидаются уже запущенные C-callbacks, поэтому `stop` может длиться дольше `shutdown_grace`, пока callback не вернулся. Синхронную C-функцию прервать нельзя.
+- Строки в `MMA_ServerConfig` (`bind_ip`, пути TLS) и значение за `tls_handshake_timeout_ms` читаются и копируются внутри `mma_server_create` и `mma_server_handle_change_config`; после этого их можно освободить.
+- **В C-хосте игнорируйте `SIGPIPE`** (`signal(SIGPIPE, SIG_IGN)`) до запуска сервера. Библиотека пишет в сокеты обычным `write`; если клиент закрыл соединение, пока сервер ещё отправляет данные, действие `SIGPIPE` по умолчанию завершает весь процесс. Rust-программы не затронуты: рантайм Rust игнорирует этот сигнал. Наблюдалось: C-хост завершился со статусом 13, когда отключился клиент с полной очередью push.
 - `mma_server_handle_change_config`: новые `FramerConfig` и `request_timeout` подхватываются соединениями; `max_batch`, `max_connections`, `max_in_flight`, адрес listener и `shutdown_grace` **не** обновляются. Смена wire-параметров без одновременного переключения клиентов ломает разбор.
 
 ### 8.7. Пример
@@ -713,8 +755,8 @@ Wire-раскладка задаётся через `config.framer` (`MMA_Framer
 | Что | Сейчас | Правило |
 |---|---|---|
 | Wire-протокол | `MMA_VERSION = 1` | повышается при несовместимых изменениях кадра или семантики |
-| Rust crate | `0.1.0` в `Cargo.toml` (git-теги доходят до `v0.1.3`) | до 1.0 breaking-изменения возможны в любом релизе; API push изменён (см. [CHANGELOG.ru.md](CHANGELOG.ru.md)) |
-| C ABI / `mma.h` | без версии | сигнатуры не менялись после добавления функций хуков; `mma_server_handle_send_to_channel` изменил поведение (без ожидания, очередь на канал); запроса версии в рантайме нет |
+| Rust crate | `0.1.0` в `Cargo.toml` (git-теги доходят до `v0.1.4`) | до 1.0 breaking-изменения возможны в любом релизе; изменились пути модулей и API push (см. [CHANGELOG.ru.md](CHANGELOG.ru.md)) |
+| C ABI / `mma.h` | без версии | `MMA_ServerConfig` получила в конце четыре поля TLS (32 байта): пересоберите весь C-код с новым заголовком; `mma_server_handle_send_to_channel` не ждёт; запроса версии в рантайме нет |
 
 Два участника совместимы по wire, только если совпадают `MMA_VERSION` **и** весь `FramerConfig`. Замечание: правило зарезервированного route для `ChannelConnect` ([§5.5](#55-зарезервированные-маршруты-и-хуки-жизненного-цикла-соединения)) меняет семантику запроса, не меняя раскладку кадра и `MMA_VERSION`; см. [CHANGELOG.ru.md](CHANGELOG.ru.md). Новые opcode или обязательное поле требуют новой `MMA_VERSION`; старый сервер закрывает соединение при неизвестном opcode запроса.
 
@@ -722,7 +764,8 @@ Wire-раскладка задаётся через `config.framer` (`MMA_Framer
 
 ## 10. Безопасность
 
-- **Нет TLS, аутентификации и защиты от replay.** Конфигурация раскладки — обфускация и не является секретом, если не распространяется как секрет. Завершайте TLS перед MMA (stunnel, sidecar-прокси) или работайте в доверенной сети.
+- **TLS необязателен и только на стороне сервера** (см. [§7.2](#72-конфигурация)); нет клиентской аутентификации, аутентификации на уровне приложения и защиты от replay. Без TLS всё, включая раскладку, читается в сети. Конфигурация раскладки — обфускация и не является секретом, если не распространяется как секрет. Неверный сертификат или ключ молча отключает TLS (см. §7.2): после каждого развёртывания проверяйте, что TLS-рукопожатие проходит.
+- В `example_certs/` лежат одноразовые CA и ключ сервера для локальных тестов. Не используйте их в production и не публикуйте собственные приватные ключи.
 - Считайте все поля от клиента недоверенными. UTF-8 проверяется только у `route`; payload и options — сырые байты.
 
 | Лимит | Значение |
@@ -746,10 +789,12 @@ Wire-раскладка задаётся через `config.framer` (`MMA_Framer
 |---|---|
 | `src/protocol/framer.rs` | энкодер/декодер кадров (приватный) |
 | `src/network/network.rs` | цикл соединения, машина состояний (приватный) |
-| `src/core/` | `commands` (Request/Response), `config`, `router` (маршруты, обработчики, хуки жизненного цикла), `server` |
+| `src/config/config.rs` | `Config`, `FramerConfig`, `BigBytesConfig`, `MMA_VERSION` |
+| `src/core/` | `commands` (Request/Response, `SocketStatus`), `router` (маршруты, обработчики, хуки жизненного цикла), `server`, `handle` (`ServerHandle`), `channel_hub` и `tls` (приватные) |
 | `src/c_api.rs` | экспорты C ABI |
 | `include/mma.h` | C-заголовок |
-| `examples/main_server.rs`, `examples/main_server.c` | примеры Rust- и C-сервера (Rust-пример также показывает connect/disconnect-хуки) |
+| `examples/example_no_tls.rs`, `examples/example_with_tls.rs`, `examples/main_server.c` | Rust-серверы без TLS и с TLS (показывают и connect/disconnect-хуки) и C-сервер |
+| `example_certs/` | тестовые CA и сертификат сервера для `example_with_tls.rs` (не для production) |
 | `mma_gui_client.py` | тестовый клиент на Tkinter (стандартная библиотека Python): настраиваемая раскладка, все три opcode, самотест кодека |
 | `.github/workflows/native-release.yml` | CI на каждый push (тесты Rust, C-пример с `-Werror`, проверка заголовка из C++); на тегах `v*` собирает нативные пакеты и публикует Release |
 | `CHANGELOG.md`, `CHANGELOG.ru.md` | история изменений с влиянием на wire / Rust API / C ABI |

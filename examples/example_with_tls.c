@@ -14,6 +14,7 @@
 #define MMA_DRAIN_TIMEOUT_MS 2000ULL
 #define MMA_SHUTDOWN_GRACE_MS 10000ULL
 #define MMA_REQUEST_TIMEOUT_MS 10000ULL
+#define MMA_TLS_HANDSHAKE_TIMEOUT_MS 10000ULL
 
 typedef struct {
     pthread_mutex_t mutex;
@@ -305,8 +306,38 @@ static int32_t register_routes(MMA_Server *server)
     return MMA_OK;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    if (argc != 3) {
+        fprintf(stderr, "Использование: %s <certificate.pem> <private-key.pem>\n", argv[0]);
+        return 2;
+    }
+
+    /*
+     * Проверяем файлы заранее: если библиотека не сможет их загрузить,
+     * она молча запустит обычный TCP без шифрования.
+     */
+    for (int i = 1; i < 3; ++i) {
+        FILE *file = fopen(argv[i], "r");
+
+        if (file == NULL) {
+            perror(argv[i]);
+            return EXIT_FAILURE;
+        }
+
+        fclose(file);
+    }
+
+    /* Значение читается и копируется внутри mma_server_create. */
+    static const uint64_t tls_handshake_timeout_ms =
+        MMA_TLS_HANDSHAKE_TIMEOUT_MS;
+
+    /*
+     * C-хост обязан игнорировать SIGPIPE: иначе закрытие сокета клиентом
+     * во время отправки завершит весь процесс.
+     */
+    signal(SIGPIPE, SIG_IGN);
+
     sigset_t signal_set;
 
     if (sigemptyset(&signal_set) != 0 ||
@@ -360,6 +391,15 @@ int main(void)
     config.framer.payload_order = 1;
     config.framer.options_key_first = 1;
     config.framer.header_length = 29;
+
+    /*
+     * TLS активен, только если tls_enable == 1 И заданы остальные три поля.
+     * Строки и значение таймаута копируются внутри mma_server_create.
+     */
+    config.tls_certificate_path = argv[1];
+    config.tls_key_path = argv[2];
+    config.tls_enable = 1;
+    config.tls_handshake_timeout_ms = &tls_handshake_timeout_ms;
 
     MMA_Server *server = NULL;
 
@@ -424,7 +464,7 @@ int main(void)
         return EXIT_FAILURE;
     }
 
-    printf("Listening on %s:%u\n", config.bind_ip, (unsigned)port);
+    printf("Listening on %s:%u (TLS)\n", config.bind_ip, (unsigned)port);
     printf("MMA channel broadcast is ready.\n");
     fflush(stdout);
 

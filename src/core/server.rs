@@ -1,162 +1,34 @@
+use crate::core::channel_hub::ChannelHub;
 use crate::core::commands::Response;
-use crate::core::config::Config;
+use crate::config::config::Config;
+use crate::core::handle::ServerHandle;
 use crate::core::router::Router;
-use crate::network::network::SocketStatus;
+use crate::core::commands::SocketStatus;
+use crate::core::tls;
+use crate::network::network::AsyncConnection;
 use crate::network::network::serve_connection;
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::RwLock;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
 use std::{io, panic};
-use ahash::HashMap;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
+use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-#[derive(Debug)]
 pub struct Server {
     config: Config,
     tcp_listener: TcpListener,
     stop: CancellationToken,
     config_receiver: watch::Receiver<Config>,
     config_sender: watch::Sender<Config>,
-    channel_hub: Arc<ChannelHub>
-}
-
-#[derive(Debug, Default)]
-pub struct ChannelHub {
-    channels: RwLock<HashMap<u32, mpsc::Sender<Response>>>
-}
-
-impl ChannelHub {
-    pub fn register(&self, id: u32, sender: mpsc::Sender<Response>) -> Result<(), String> {
-        let mut guard = self.channels.write().map_err(|_| String::from("Cannot get access to list of channels"))?;
-        guard.insert(id, sender);
-        Ok(())
-    }
-
-    pub fn disconnect(&self, id: u32) -> Result<(), String> {
-        let mut guard = self.channels.write().map_err(|_| String::from("Cannot get access to list of channels"))?;
-        guard.remove(&id);
-        Ok(())
-    }
-
-    pub async fn send(&self, id: u32, item: Response) -> Result<(), String> {
-        if id == 0 {
-            let channels = {
-                let guard = self.channels.read().map_err(|_| String::from("Cannot get access to list of channel"))?;
-                guard.values().cloned().collect::<Vec<_>>()
-            };
-
-            for sender in channels {
-                if sender.send(item.clone()).await.is_err() {
-                    return Err(String::from("Error with sending"));
-                };
-            }
-        } else {
-            let sender = {
-                let guard = self.channels.read().map_err(|_| String::from("Cannot get access to list of channel"))?;
-    
-                match guard.get(&id).cloned() {
-                    Some(s) => s,
-                    None => {
-                        return Err(String::from("No such channel"));
-                    }
-                }
-            };
-    
-            if sender.send(item).await.is_err() {
-                return Err(String::from("Error with sending"));
-            };
-        }
-
-        Ok(())
-    }
-
-    pub fn try_send(&self, id: u32, item: Response,) -> Result<(), String> {
-        if id == 0 {
-            let senders = {
-                let guard = self.channels.read().map_err(|_| String::from("Cannot get access to list of channel"))?;
-
-                guard.values().cloned().collect::<Vec<_>>()
-            };
-
-            let total = senders.len();
-            let mut delivered = 0;
-            let mut failed = 0;
-
-            for sender in senders {
-                match sender.try_send(item.clone()) {
-                    Ok(()) => delivered += 1,
-                    Err(e) => {
-                        failed += 1;
-                        eprintln!("Broadcast error: {e}");
-                    }
-                }
-            }
-
-            if failed == 0 {
-                return Ok(());
-            } else {
-                return Err(format!(
-                    "Partial broadcast: {delivered}/{total} channels accepted the message"
-                ));
-            }
-        } else {
-            let sender = {
-                let guard = self.channels.read().map_err(|_| String::from("Cannot get access to list of channel"))?;
-    
-                match guard.get(&id).cloned() {
-                    Some(s) => s,
-                    None => {
-                        return Err(String::from("No such channel"));
-                    }
-                }
-            };
-    
-            if sender.try_send(item).is_err() {
-                return Err(String::from("Error with sending"));
-            };
-        }
-
-
-        Ok(())
-    }
-
-}
-
-#[derive(Clone)]
-pub struct ServerHandle {
-    config_sender: watch::Sender<Config>,
-    channel_hub: Arc<ChannelHub>
-}
-
-impl ServerHandle {
-    pub fn change_config(&self, config: Config) -> Result<(), std::io::Error> {
-        Server::validate_config(&config)?;
-
-        self.config_sender.send(config).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "Cannot update config: no active receivers",
-            )
-        })?;
-
-        Ok(())
-    }
-
-    pub async fn send_to_channel(&self, id: u32, item: Response) -> Result<(), String> {
-        self.channel_hub.send(id, item).await
-    }
-
-    pub fn try_send_to_channel(&self, id: u32, item: Response) -> Result<(), String> {
-        self.channel_hub.try_send(id, item)
-    }
+    channel_hub: Arc<ChannelHub>,
+    tls_acceptor: Option<TlsAcceptor>
 }
 
 impl Server {
@@ -166,12 +38,7 @@ impl Server {
         Self::from_listener(config, listener)
     }
 
-    pub fn handle(&self) -> ServerHandle {
-        ServerHandle {
-            channel_hub: Arc::clone(&self.channel_hub),
-            config_sender: self.config_sender.clone(),
-        }
-    }
+    pub fn handle(&self) -> ServerHandle { ServerHandle::new(self.config_sender.clone(), Arc::clone(&self.channel_hub)) }
 
     pub fn from_listener(
         config: Config,
@@ -179,13 +46,23 @@ impl Server {
     ) -> Result<Self, std::io::Error> {
         Self::validate_config(&config)?;
         let (config_sender, config_receiver) = watch::channel::<Config>(config.clone());
+        let tls_acceptor = if config.tls_enable && config.tls_certificate_path.is_some() && config.tls_key_path.is_some() && config.tls_handshake_timeout.is_some() {
+            match tls::create_tls_acceptor(config.tls_certificate_path.clone().unwrap(), config.tls_key_path.clone().unwrap()) {
+                Ok(a)  => Some(a),
+                Err(e) => {
+                    eprintln!("Invalid TLS config: {}", e);
+                    None
+                }
+            }
+        } else { None };
         Result::Ok(Self {
             config,
             tcp_listener,
             stop: CancellationToken::new(),
             config_receiver,
             config_sender,
-            channel_hub: Arc::new(ChannelHub::default())
+            channel_hub: Arc::new(ChannelHub::default()),
+            tls_acceptor: tls_acceptor
         })
     }
 
@@ -197,7 +74,7 @@ impl Server {
         self.stop.cancel();
     }
 
-    fn validate_config(config: &Config) -> Result<(), io::Error> {
+    pub fn validate_config(config: &Config) -> Result<(), io::Error> {
         if let Err(e) = config.validate() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, e));
         }
@@ -229,8 +106,10 @@ impl Server {
         tokio::pin!(shutdown);
 
         let conns_semaphore = Arc::new(Semaphore::new(self.config.max_connections as usize));
-
         let current_channel_connection_id: Arc<AtomicU32> = Arc::new(AtomicU32::new(1));
+
+        let tls_acceptor = self.tls_acceptor.clone();
+        let tls_handshake_timeout = self.config.tls_handshake_timeout;
 
         loop {
             let conns_semaphore = Arc::clone(&conns_semaphore);
@@ -256,26 +135,56 @@ impl Server {
             let channel_hub_disc = Arc::clone(&self.channel_hub);
             let channel_hub = Arc::clone(&self.channel_hub);
 
-            conns.spawn(serve_connection(
-                socket,
-                Arc::clone(&router),
-                self.config_receiver.clone(),
-                Arc::clone(&semaphore),
-                stop.clone(),
-                kill.clone(),
-                permit,
-                move || {
-                    let conn_id = current_channel_connection_id.fetch_add(1, Ordering::Relaxed);
-                    let (sender, receiver) = mpsc::channel::<Response>(256);
-                    if let Err(e) = channel_hub.register(conn_id, sender) {
-                        return Err(e);
+            let router = Arc::clone(&router);
+            let config_receiver = self.config_receiver.clone();
+            let semaphore = Arc::clone(&semaphore);
+            let stop = stop.clone();
+            let kill = kill.clone();
+            let tls_acceptor = tls_acceptor.clone();
+
+            conns.spawn(async move {
+                let stream: Box<dyn AsyncConnection> = match (tls_acceptor, tls_handshake_timeout) {
+                    (Some(ta), Some(tht)) => {
+                        match tokio::time::timeout(tht, ta.accept(socket)).await {
+                            Ok(Ok(ts)) => {
+                                Box::new(ts)
+                            },
+                            Ok(Err(e)) => {
+                                eprintln!("TLS Handshake failed: {}", e);
+                                return;
+                            },
+                            Err(_) => {
+                                eprintln!("TLS Handshake timeout");
+                                return;
+                            }
+                        }
+                    },
+                    _ => {
+                        Box::new(socket)
                     }
-                    Ok((SocketStatus::Channel(conn_id), receiver))
-                },
-                move |id| {
-                    channel_hub_disc.disconnect(id)
-                },
-            ));
+                };
+
+                serve_connection(
+                    stream,
+                    router,
+                    config_receiver,
+                    semaphore,
+                    stop,
+                    kill,
+                    permit,
+                    move || {
+                        let conn_id = current_channel_connection_id.fetch_add(1, Ordering::Relaxed);
+                        let (sender, receiver) = mpsc::channel::<Response>(256);
+                        if let Err(e) = channel_hub.register(conn_id, sender) {
+                            return Err(e);
+                        }
+                        Ok((SocketStatus::Channel(conn_id), receiver))
+                    },
+                    move |id| {
+                        channel_hub_disc.disconnect(id)
+                    },
+                ).await;
+            });
         }
 
         stop.cancel();

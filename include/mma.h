@@ -1,4 +1,3 @@
-
 #ifndef MMA_H
 #define MMA_H
 
@@ -69,6 +68,11 @@ typedef struct {
     uint64_t drain_timeout_ms;
     uint64_t shutdown_grace_ms;
     uint64_t request_timeout_ms;
+    /* TLS is on only if tls_enable is 1 and the three other fields are set. */
+    const char *tls_certificate_path;
+    const char *tls_key_path;
+    uint8_t tls_enable; /* 0 or 1 only */
+    const uint64_t *tls_handshake_timeout_ms; /* NULL = none; value in ms */
 } MMA_ServerConfig;
 
 typedef struct {
@@ -106,9 +110,10 @@ typedef int32_t (*MMA_ChannelHandlerCallback)(
  * Request and option data are borrowed and valid only during the callback.
  * Route callbacks receive a response value and return the response value after
  * applying zero or more transformations with mma_response_* functions.
- * Callbacks may execute concurrently on runtime worker threads,
+ * Callbacks may execute concurrently on Tokio's blocking thread pool,
  * so synchronize shared user_data and keep it alive until the server stops.
- * Register routes before starting the server; callbacks should not block.
+ * Register routes before starting the server; keep callbacks short.
+ * A C host should ignore SIGPIPE: signal(SIGPIPE, SIG_IGN).
  */
 int32_t mma_server_config_default(MMA_ServerConfig *output);
 int32_t mma_server_create(const MMA_ServerConfig *config, MMA_Server **output);

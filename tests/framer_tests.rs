@@ -4,7 +4,7 @@ use bytes::{Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
 use MMA::core::commands::{Response, ResponseOpcode};
-use MMA::core::config::FramerConfig;
+use MMA::config::config::FramerConfig;
 use MMA::protocol::framer::Framer;
 
 fn response(payload: &[u8], options: Vec<(&str, &str)>) -> Response {

@@ -14,7 +14,48 @@
 
 ## [Unreleased]
 
-Изменения после `v0.1.3` (коммит `95a5abb`). Предлагаемая версия: **0.2.0** — Rust API рассылки несовместим с 0.1.x; `MMA_VERSION` остаётся `1` (раскладка кадра и семантика запросов этими правками не меняются).
+Изменения после `v0.1.4` (коммит `b6b8579`). Предлагаемая версия: **0.2.0** — изменились пути модулей и `Config` (Rust) и размер `MMA_ServerConfig` (C ABI). `MMA_VERSION` остаётся `1`: раскладка кадра и семантика запросов не менялись; TLS оборачивает неизменный поток байтов.
+
+### Добавлено
+
+- **TLS (серверная сторона)** на `tokio-rustls` 0.26 / rustls, без клиентских сертификатов. *Rust, ABI*
+  - В `Config` четыре новых поля: `tls_enable: bool`, `tls_certificate_path: Option<String>`, `tls_key_path: Option<String>`, `tls_handshake_timeout: Option<Duration>`. По умолчанию всё выключено/`None`.
+  - В конце `MMA_ServerConfig` четыре новых поля: `tls_certificate_path`, `tls_key_path` (`const char *`), `tls_enable` (`bool`, один байт) и `tls_handshake_timeout` (`const uint64_t *`, миллисекунды; `NULL` = нет). Размер на x86-64 вырос с 64 до 96 байт.
+  - Соединение, не прошедшее рукопожатие или не завершившее его за `tls_handshake_timeout`, закрывается и попадает в лог.
+  - `ServerHandle::change_config` (и `mma_server_handle_change_config`) отклоняет изменение любого поля TLS: `InvalidInput` в Rust, `MMA_SERVER_ERROR` в C.
+- `examples/example_with_tls.rs` (пути к сертификату и ключу — аргументами) и `examples/example_no_tls.rs`; `example_certs/` с локальным тестовым CA и сертификатом сервера для `localhost`, `127.0.0.1` и `::1` (действует до 2027-11-07).
+- В `mma_gui_client.py` появился раздел TLS (транспортная защита, проверка сертификата, имя сервера).
+
+### Изменено
+
+- **Rust API (breaking).**
+  - `Config`, `FramerConfig`, `BigBytesConfig`, `ConfigError` и `MMA_VERSION` перенесены из `MMA::core::config` в `MMA::config::config`.
+  - `ServerHandle` перенесён из `core::server` в `core::handle`. `ChannelHub` теперь приватный; в 0.1.4 он был доступен через `core::server`.
+  - `SocketStatus` перенесён из приватного сетевого модуля в `core::commands` и стал публичным.
+  - В `Config` четыре новых поля, поэтому литералы структуры без `..Config::default()` больше не компилируются.
+  - `examples/main_server.rs` заменён на `no_tls` и `with_tls`; `cargo run --example main_server` больше не работает.
+- `serve_connection` обобщён по типу потока (`AsyncConnection`: `AsyncRead + AsyncWrite + Unpin + Send`), поэтому TLS и обычный TCP используют один путь кода. Внутреннее изменение.
+- README: TLS, новые пути модулей, 96-байтная `MMA_ServerConfig`, правило про SIGPIPE, поведение дубликата route в C API. Прежнее утверждение, что существует `FramerConfig::new()`, было ошибочным; конструктор — `FramerConfig::default()` (`BigBytesConfig::new()` существует).
+
+### Известные проблемы
+
+Проверено запуском кода (`cargo build --release`, `cargo test --locked --all-targets`: 14 тестов проходят; живые сессии с `examples/with_tls`, `examples/no_tls` и C-программой, покрывающей все 20 экспортируемых функций).
+
+1. **Ошибка TLS молча отключает TLS.** Если `tls_enable` равно `true`, но сертификат или ключ не загрузились, `Server::new`/`from_listener` и `mma_server_create` + `mma_server_start` завершаются успешно, пишут в stderr `Invalid TLS config: …` и работают по **обычному TCP**. То же происходит, если `tls_enable` равно `true`, но не хватает пути или `tls_handshake_timeout`. Подтверждено: обычный клиент получил нормальные ответы от сервера, запущенного с `/nonexistent.crt`. Предлагаемое исправление: возвращать ошибку из `from_listener` и `mma_server_create`.
+2. **В `include/mma.h` нет новых полей `MMA_ServerConfig`.** Заголовок в дереве по-прежнему описывает структуру в 64 байта, а библиотека пишет и читает 96. Подтверждено: `mma_server_config_default` перезаписала 32 байта после структуры вызывающего (порча стека), а `mma_server_create` читает недостающие поля из того, что лежит дальше. Затронуты `examples/main_server.c`, сборка C-примера в CI и любой C-код, собранный с этим заголовком; CI этого не видит, потому что компилирует с тем же устаревшим заголовком. Исправленный заголовок (`uint8_t tls_enable`, обновлённый комментарий) приложен к этому изменению.
+3. **C-хост убивается сигналом `SIGPIPE`.** Запись в сокет, у которого закрыт собеседник, вызывает `SIGPIPE`; C-хост его не игнорирует (Rust-бинарник игнорирует). Подтверждено: процесс-хост завершился со статусом 13, когда отключился клиент с полной очередью push. Обход: `signal(SIGPIPE, SIG_IGN)` до `mma_server_start`. Предлагаемое исправление: игнорировать сигнал внутри библиотеки или отправлять с `MSG_NOSIGNAL`.
+4. В C API дубликат route проходит `mma_server_register_route` (возвращает `MMA_OK`) и падает только в `mma_server_start` с `MMA_SERVER_ERROR`; причина идёт в stderr.
+5. `Config::validate` не проверяет поля TLS.
+6. Комментарий в заголовке говорил, что callbacks выполняются «на worker-потоках рантайма»; на деле они идут в blocking-пуле Tokio (исправлено в приложенном заголовке).
+7. Автотестов на TLS, `ChannelHub`, хуки жизненного цикла и C ABI нет.
+8. Файлы, которые лежат рядом с исходниками, но не в git: `mma_gui_client.py` (на него ссылаются README и запись 0.1.3) и `MMA_Audit_RU.md`. В `example_certs/` лежат приватные ключи (`ca/ca.key`, `server/server.key`); это одноразовые тестовые ключи, но ключ CA в публичном репозитории — плохая привычка, а `.gitignore` его не исключает.
+9. Оставшиеся известные проблемы 0.1.3 и 0.1.4: пользовательский disconnect-хук не вызывается при обрыве TCP; `send_to_channel(0, ..)` блокируется одним не читающим клиентом; нет лимита запросов на соединение.
+10. Предупреждения компилятора: имя crate `MMA` не в snake case, варианты `ReservedRoutes` в верхнем регистре, два неиспользуемых импорта.
+11. Исходники в CRLF; приложен `.gitattributes` с `* text=auto eol=lf`.
+
+## [0.1.4] - 2026-11-07
+
+Тег `v0.1.4` (коммит `b6b8579`). Изменения после `v0.1.3` (коммит `95a5abb`). `MMA_VERSION` остаётся `1`; в `Cargo.toml` по-прежнему `0.1.0`.
 
 ### Изменено
 
@@ -86,16 +127,7 @@
 
 - Синхронный C-callback больше не блокирует асинхронный worker Tokio (см. *Изменено → ABI*). Это снимает главный риск голодания, названный в прежнем README («callbacks выполняются на worker-потоках»).
 
-### Известные проблемы на этом теге
 
-Пункты 1 и 2 исправлены в *Unreleased* выше; пункт 3 остаётся.
-
-1. `ChannelConnect` выполняет замыкание connect (оно создаёт подписку на канал) **до** проверки route, поэтому неверный route может оставить неиспользуемую подписку. Найдено чтением кода, не измерено.
-2. После disconnect-хука кадр всё равно идёт в маршрутизацию channel-обработчиков. Без обработчика `CHANNEL_DISCONNECT` клиент перед закрытием соединения получает `NotFound` («No such method»). Подтверждено живым тестом.
-3. Обрыв TCP-соединения disconnect-хук не запускает; только явный кадр `CHANNEL_DISCONNECT`.
-4. Зарезервированные route сравниваются через `to_uppercase()` на каждом запросе (без учёта регистра, с аллокацией). Пустой `if` в ветке `Fresh`/`ChannelMessage` — мёртвый код.
-5. Хуки и проверки зарезервированных route не покрыты автотестами. Проверено вручную: `cargo build --release`, `cargo test` (14 тестов проходят, без изменений), C-пример компилируется с новым заголовком, все 20 функций `mma_*` из заголовка экспортируются, живая сессия с `examples/main_server` (неверный route → `BadRequest`; connect-хук → push `Connect: …`; повторный connect → `Conflict`; disconnect → push хука, `NotFound`, закрытие через ≈ 4 с при `drain_timeout` 2 с; `CHANNEL_DISCONNECT` на новом соединении → `BadRequest`).
-6. Переводы строк: 18 файлов рабочего дерева в CRLF (изменение без содержимого относительно коммита). Перед коммитом добавьте `.gitattributes` (`* text=auto eol=lf`), чтобы дифф оставался читаемым.
-
-[Unreleased]: https://github.com/Edestuss0/MMA-Network-protocol/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/Edestuss0/MMA-Network-protocol/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/Edestuss0/MMA-Network-protocol/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/Edestuss0/MMA-Network-protocol/compare/432905c...v0.1.3
