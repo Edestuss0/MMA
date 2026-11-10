@@ -1,8 +1,8 @@
+use crate::config::config::Config;
 use crate::core::commands::ProtocolError;
 use crate::core::commands::Request;
 use crate::core::commands::RequestOpcode;
 use crate::core::commands::Response;
-use crate::config::config::Config;
 use crate::core::commands::SocketStatus;
 use crate::core::router::ReservedRoutes;
 use crate::core::router::Router;
@@ -11,10 +11,6 @@ use bytes::Bytes;
 use futures_util::FutureExt;
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
-use tokio::io::AsyncRead;
-use tokio::io::AsyncWrite;
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use std::panic;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -22,22 +18,20 @@ use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use tokio::io::AsyncRead;
+use tokio::io::AsyncWrite;
+use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::watch;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinHandle;
 use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
+pub trait AsyncConnection: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
 
-pub trait AsyncConnection:
-    AsyncRead + AsyncWrite + Unpin + Send + 'static
-{}
-
-impl<T> AsyncConnection for T
-where
-    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{}
+impl<T> AsyncConnection for T where T: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
 
 pub async fn serve_connection<S, F, T>(
     socket: S,
@@ -48,7 +42,7 @@ pub async fn serve_connection<S, F, T>(
     kill: CancellationToken,
     conn_permit: OwnedSemaphorePermit,
     on_channel_connect: F,
-    on_channel_disconnect: T
+    on_channel_disconnect: T,
 ) where
     S: AsyncConnection,
     F: Fn() -> Result<(SocketStatus, mpsc::Receiver<Response>), String> + Send + Sync + 'static,
@@ -66,14 +60,14 @@ pub async fn serve_connection<S, F, T>(
 
     let conn_semaphore = Arc::new(Semaphore::new(1));
     let tx_copy = tx.clone();
-    
+
     let on_channel_connect = Arc::new(on_channel_connect);
     let socket_status = Arc::new(AtomicU64::new(SocketStatus::to_u64(SocketStatus::Fresh)));
     let channel_task: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
-    
+
     let mut writer = writer(sink, rx, config.max_batch);
     let on_channel_disconnect = Arc::new(on_channel_disconnect);
-    
+
     let disconnect = CancellationToken::new();
 
     loop {
@@ -104,16 +98,10 @@ pub async fn serve_connection<S, F, T>(
             }
             f = stream.next() => match f { Some(f) => f, None => {
                 let status = SocketStatus::from_u64(socket_status.load(Ordering::Relaxed));
-                match status {
-                    SocketStatus::Channel(id) => {
-                        if let Err(e) = on_channel_disconnect(id) {
-                            eprintln!("Error with channel disconnecting: {}", e);
-                        };
-                    },
-                    _ => {
-
-                    }
-                };
+                if let SocketStatus::Channel(id) = status
+                    && let Err(e) = on_channel_disconnect(id) {
+                        eprintln!("Error with channel disconnecting: {}", e);
+                    };
                 break;
             }},
         };
@@ -149,7 +137,6 @@ pub async fn serve_connection<S, F, T>(
                 let socket_status_disc = Arc::clone(&socket_status);
                 let on_channel_disconnect = Arc::clone(&on_channel_disconnect);
 
-
                 inflight.spawn(async move {
                     match tokio::time::timeout(
                         request_timeout,
@@ -161,8 +148,8 @@ pub async fn serve_connection<S, F, T>(
                             router,
                             Arc::new(move || -> (SocketStatus, Option<u32>) {
                                 let (status, mut receiver) = match on_channel_connect() {
-                                    Ok(s)  => s,
-                                    Err(e)  => {
+                                    Ok(s) => s,
+                                    Err(e) => {
                                         eprintln!("Error with connecting to channel: {}", e);
                                         return (SocketStatus::Fresh, None);
                                     }
@@ -170,7 +157,7 @@ pub async fn serve_connection<S, F, T>(
 
                                 let conn_id = match status {
                                     SocketStatus::Channel(id) => id,
-                                    _ => return (status, None)
+                                    _ => return (status, None),
                                 };
 
                                 let tx_channel = tx_for_channel.clone();
@@ -198,26 +185,25 @@ pub async fn serve_connection<S, F, T>(
                                 (status, Some(conn_id))
                             }),
                             Arc::new(move || {
-                                let status = SocketStatus::from_u64(socket_status_disc.load(Ordering::Relaxed));
-                                match status {
-                                    SocketStatus::Channel(id) => {
-                                        if let Err(e) = on_channel_disconnect(id) {
-                                            eprintln!("Error with channel disconnecting: {}", e);
-                                        };
-                                    },
-                                    _ => {
-
-                                    }
-                                };
+                                let status = SocketStatus::from_u64(
+                                    socket_status_disc.load(Ordering::Relaxed),
+                                );
+                                if let SocketStatus::Channel(id) = status
+                                    && let Err(e) = on_channel_disconnect(id) {
+                                        eprintln!("Error with channel disconnecting: {}", e);
+                                    };
                                 disconnect.cancel();
-                            })
+                            }),
                         ),
-                    ).await {
+                    )
+                    .await
+                    {
                         Ok(r) => {
                             if r.is_some()
-                                && let Err(e) = tx.send(r.unwrap()).await {
-                                    eprintln!("{}", e);
-                                }
+                                && let Err(e) = tx.send(r.unwrap()).await
+                            {
+                                eprintln!("{}", e);
+                            }
                         }
                         Err(_) => {
                             if let Err(e) = tx.send(Response::timeout(req_id)).await {
@@ -254,23 +240,21 @@ pub async fn serve_connection<S, F, T>(
         }
     }
 
-    let status = SocketStatus::from_u64( socket_status.load(Ordering::Relaxed));
+    let status = SocketStatus::from_u64(socket_status.load(Ordering::Relaxed));
 
-    if let SocketStatus::Channel(id) = status {
-        if let Err(e) = on_channel_disconnect(id) {
+    if let SocketStatus::Channel(id) = status
+        && let Err(e) = on_channel_disconnect(id) {
             eprintln!("Error with channel disconnect: {e}");
         }
-    }
 
     inflight.close();
     tokio::select! { _ = inflight.wait() => {}, _ = kill.cancelled() => {} }
     drop(tx);
     drop(conn_permit);
-    if let Ok(mut slot) = channel_task.lock() {
-        if let Some(task) = slot.take() {
+    if let Ok(mut slot) = channel_task.lock()
+        && let Some(task) = slot.take() {
             task.abort();
         }
-    }
     if kill.is_cancelled() {
         writer.abort();
         let _ = writer.await;
@@ -293,11 +277,11 @@ async fn handle_cmd<F, T>(
     status_permit: OwnedSemaphorePermit,
     router: Arc<Router>,
     on_channel_connect: Arc<F>,
-    on_channel_disconnect: Arc<T>
+    on_channel_disconnect: Arc<T>,
 ) -> Option<Response>
 where
     F: Fn() -> (SocketStatus, Option<u32>) + Send + Sync + 'static,
-    T: Fn() -> () + Send + Sync + 'static,
+    T: Fn() + Send + Sync + 'static,
 {
     let req_id = cmd.headers.req_id;
 
@@ -310,7 +294,10 @@ where
     match status {
         SocketStatus::Fresh => match cmd.headers.opcode {
             RequestOpcode::Once => {
-                if change_socket_status(SocketStatus::Once, socket_status, status_permit).await.is_err() {
+                if change_socket_status(SocketStatus::Once, socket_status, status_permit)
+                    .await
+                    .is_err()
+                {
                     return None;
                 };
                 let response = match AssertUnwindSafe(router.handle(cmd)).catch_unwind().await {
@@ -323,7 +310,9 @@ where
                 return Some(response);
             }
             RequestOpcode::ChannelConnect => {
-                if cmd.route.to_uppercase() == ReservedRoutes::CHANNEL_CONNECT.to_string().to_uppercase() {
+                if cmd.route.to_uppercase()
+                    == ReservedRoutes::CHANNEL_CONNECT.to_string().to_uppercase()
+                {
                     let (status, id) = on_channel_connect();
 
                     let conn_id = match id {
@@ -343,8 +332,15 @@ where
                         return Some(Response::internal_error(req_id));
                     }
 
-                    if AssertUnwindSafe(router.on_channel_connect(cmd, conn_id)).catch_unwind().await.is_err() {
-                        if change_socket_status(status, socket_status, status_permit).await.is_err() {
+                    if AssertUnwindSafe(router.on_channel_connect(cmd, conn_id))
+                        .catch_unwind()
+                        .await
+                        .is_err()
+                    {
+                        if change_socket_status(status, socket_status, status_permit)
+                            .await
+                            .is_err()
+                        {
                             return None;
                         };
 
@@ -354,7 +350,10 @@ where
                         return Some(Response::internal_error(req_id));
                     }
 
-                    if change_socket_status(status, socket_status, status_permit,).await.is_err() {
+                    if change_socket_status(status, socket_status, status_permit)
+                        .await
+                        .is_err()
+                    {
                         drop(permit);
                         return None;
                     }
@@ -366,7 +365,10 @@ where
                     drop(status_permit);
                     drop(permit);
 
-                    return Some(Response::bad_request(req_id, Some(Bytes::from("Route must match the opcode"))));
+                    return Some(Response::bad_request(
+                        req_id,
+                        Some(Bytes::from("Route must match the opcode")),
+                    ));
                 }
             }
             RequestOpcode::ChannelMessage => {
@@ -396,8 +398,8 @@ where
                     return Some(Response::connection_type_mismatch(req_id));
                 }
             }
-        },
-        SocketStatus::Channel(conn_id) => { 
+        }
+        SocketStatus::Channel(conn_id) => {
             drop(status_permit);
             match cmd.headers.opcode {
                 RequestOpcode::ChannelConnect => {
@@ -408,14 +410,25 @@ where
                     ));
                 }
                 RequestOpcode::ChannelMessage => {
-                    if cmd.route.to_uppercase() == ReservedRoutes::CHANNEL_DISCONNECT.to_string().to_uppercase() {
-                        if AssertUnwindSafe(router.on_channel_disconnect(cmd.clone(), conn_id)).catch_unwind().await.is_err() {
+                    if cmd.route.to_uppercase()
+                        == ReservedRoutes::CHANNEL_DISCONNECT
+                            .to_string()
+                            .to_uppercase()
+                    {
+                        if AssertUnwindSafe(router.on_channel_disconnect(cmd.clone(), conn_id))
+                            .catch_unwind()
+                            .await
+                            .is_err()
+                        {
                             return Some(Response::internal_error(req_id));
                         };
                         on_channel_disconnect();
                         return None;
                     }
-                    match AssertUnwindSafe(router.handle_channel(cmd, &conn_id)).catch_unwind().await {
+                    match AssertUnwindSafe(router.handle_channel(cmd, &conn_id))
+                        .catch_unwind()
+                        .await
+                    {
                         Result::Ok(Result::Err(r)) => {
                             drop(permit);
                             return Some(r);
@@ -432,7 +445,7 @@ where
                     return Some(Response::connection_type_mismatch(req_id));
                 }
             }
-        },
+        }
     };
 
     None
@@ -442,9 +455,9 @@ fn writer<S>(
     mut sink: SplitSink<Framed<S, Framer>, Response>,
     mut rx: Receiver<Response>,
     max_batch: u32,
-) -> tokio::task::JoinHandle<()> 
-where 
-    S: AsyncConnection
+) -> tokio::task::JoinHandle<()>
+where
+    S: AsyncConnection,
 {
     tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
@@ -546,7 +559,11 @@ where
     })
 }
 
-async fn change_socket_status(new: SocketStatus, status: Arc<AtomicU64>, permit: OwnedSemaphorePermit) -> Result<(), ()> {
+async fn change_socket_status(
+    new: SocketStatus,
+    status: Arc<AtomicU64>,
+    permit: OwnedSemaphorePermit,
+) -> Result<(), ()> {
     status.store(SocketStatus::to_u64(new), Ordering::Relaxed);
     drop(permit);
     Ok(())

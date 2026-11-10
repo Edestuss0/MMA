@@ -6,18 +6,24 @@ use crate::core::commands::Response;
 
 #[derive(Debug, Default)]
 pub struct ChannelHub {
-    channels: RwLock<HashMap<u32, mpsc::Sender<Response>>>
+    channels: RwLock<HashMap<u32, mpsc::Sender<Response>>>,
 }
 
 impl ChannelHub {
     pub fn register(&self, id: u32, sender: mpsc::Sender<Response>) -> Result<(), String> {
-        let mut guard = self.channels.write().map_err(|_| String::from("Cannot get access to list of channels"))?;
+        let mut guard = self
+            .channels
+            .write()
+            .map_err(|_| String::from("Cannot get access to list of channels"))?;
         guard.insert(id, sender);
         Ok(())
     }
 
     pub fn disconnect(&self, id: u32) -> Result<(), String> {
-        let mut guard = self.channels.write().map_err(|_| String::from("Cannot get access to list of channels"))?;
+        let mut guard = self
+            .channels
+            .write()
+            .map_err(|_| String::from("Cannot get access to list of channels"))?;
         guard.remove(&id);
         Ok(())
     }
@@ -25,7 +31,10 @@ impl ChannelHub {
     pub async fn send(&self, id: u32, item: Response) -> Result<(), String> {
         if id == 0 {
             let channels = {
-                let guard = self.channels.read().map_err(|_| String::from("Cannot get access to list of channel"))?;
+                let guard = self
+                    .channels
+                    .read()
+                    .map_err(|_| String::from("Cannot get access to list of channel"))?;
                 guard.values().cloned().collect::<Vec<_>>()
             };
 
@@ -36,8 +45,11 @@ impl ChannelHub {
             }
         } else {
             let sender = {
-                let guard = self.channels.read().map_err(|_| String::from("Cannot get access to list of channel"))?;
-    
+                let guard = self
+                    .channels
+                    .read()
+                    .map_err(|_| String::from("Cannot get access to list of channel"))?;
+
                 match guard.get(&id).cloned() {
                     Some(s) => s,
                     None => {
@@ -45,7 +57,7 @@ impl ChannelHub {
                     }
                 }
             };
-    
+
             if sender.send(item).await.is_err() {
                 return Err(String::from("Error with sending"));
             };
@@ -54,10 +66,13 @@ impl ChannelHub {
         Ok(())
     }
 
-    pub fn try_send(&self, id: u32, item: Response,) -> Result<(), String> {
+    pub fn try_send(&self, id: u32, item: Response) -> Result<(), String> {
         if id == 0 {
             let senders = {
-                let guard = self.channels.read().map_err(|_| String::from("Cannot get access to list of channel"))?;
+                let guard = self
+                    .channels
+                    .read()
+                    .map_err(|_| String::from("Cannot get access to list of channel"))?;
 
                 guard.values().cloned().collect::<Vec<_>>()
             };
@@ -85,8 +100,11 @@ impl ChannelHub {
             }
         } else {
             let sender = {
-                let guard = self.channels.read().map_err(|_| String::from("Cannot get access to list of channel"))?;
-    
+                let guard = self
+                    .channels
+                    .read()
+                    .map_err(|_| String::from("Cannot get access to list of channel"))?;
+
                 match guard.get(&id).cloned() {
                     Some(s) => s,
                     None => {
@@ -94,15 +112,12 @@ impl ChannelHub {
                     }
                 }
             };
-    
+
             if sender.try_send(item).is_err() {
                 return Err(String::from("Error with sending"));
             };
         }
 
-
         Ok(())
     }
-
 }
-

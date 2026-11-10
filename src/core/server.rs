@@ -1,13 +1,14 @@
+use crate::config::config::Config;
 use crate::core::channel_hub::ChannelHub;
 use crate::core::commands::Response;
-use crate::config::config::Config;
+use crate::core::commands::SocketStatus;
 use crate::core::handle::ServerHandle;
 use crate::core::router::Router;
-use crate::core::commands::SocketStatus;
 use crate::core::tls;
 use crate::network::network::AsyncConnection;
 use crate::network::network::serve_connection;
 use std::future::Future;
+use std::io::ErrorKind;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
@@ -28,7 +29,7 @@ pub struct Server {
     config_receiver: watch::Receiver<Config>,
     config_sender: watch::Sender<Config>,
     channel_hub: Arc<ChannelHub>,
-    tls_acceptor: Option<TlsAcceptor>
+    tls_acceptor: Option<TlsAcceptor>,
 }
 
 impl Server {
@@ -38,7 +39,9 @@ impl Server {
         Self::from_listener(config, listener)
     }
 
-    pub fn handle(&self) -> ServerHandle { ServerHandle::new(self.config_sender.clone(), Arc::clone(&self.channel_hub)) }
+    pub fn handle(&self) -> ServerHandle {
+        ServerHandle::new(self.config_sender.clone(), Arc::clone(&self.channel_hub))
+    }
 
     pub fn from_listener(
         config: Config,
@@ -46,15 +49,15 @@ impl Server {
     ) -> Result<Self, std::io::Error> {
         Self::validate_config(&config)?;
         let (config_sender, config_receiver) = watch::channel::<Config>(config.clone());
-        let tls_acceptor = if config.tls_enable && config.tls_certificate_path.is_some() && config.tls_key_path.is_some() && config.tls_handshake_timeout.is_some() {
-            match tls::create_tls_acceptor(config.tls_certificate_path.clone().unwrap(), config.tls_key_path.clone().unwrap()) {
-                Ok(a)  => Some(a),
-                Err(e) => {
-                    eprintln!("Invalid TLS config: {}", e);
-                    None
-                }
+        let tls_acceptor = if config.tls_config.is_some() {
+            let config = config.tls_config.clone().unwrap();
+            match tls::create_tls_acceptor(config.tls_certificate_path, config.tls_key_path) {
+                Ok(a) => Some(a),
+                Err(e) => return Err(io::Error::new(ErrorKind::InvalidInput, e)),
             }
-        } else { None };
+        } else {
+            None
+        };
         Result::Ok(Self {
             config,
             tcp_listener,
@@ -62,7 +65,7 @@ impl Server {
             config_receiver,
             config_sender,
             channel_hub: Arc::new(ChannelHub::default()),
-            tls_acceptor: tls_acceptor
+            tls_acceptor,
         })
     }
 
@@ -109,7 +112,17 @@ impl Server {
         let current_channel_connection_id: Arc<AtomicU32> = Arc::new(AtomicU32::new(1));
 
         let tls_acceptor = self.tls_acceptor.clone();
-        let tls_handshake_timeout = self.config.tls_handshake_timeout;
+        let tls_handshake_timeout = if self.config.tls_config.is_some() {
+            let dur = self
+                .config
+                .tls_config
+                .clone()
+                .unwrap()
+                .tls_handshake_timeout;
+            Some(dur)
+        } else {
+            None
+        };
 
         loop {
             let conns_semaphore = Arc::clone(&conns_semaphore);
@@ -146,22 +159,18 @@ impl Server {
                 let stream: Box<dyn AsyncConnection> = match (tls_acceptor, tls_handshake_timeout) {
                     (Some(ta), Some(tht)) => {
                         match tokio::time::timeout(tht, ta.accept(socket)).await {
-                            Ok(Ok(ts)) => {
-                                Box::new(ts)
-                            },
+                            Ok(Ok(ts)) => Box::new(ts),
                             Ok(Err(e)) => {
                                 eprintln!("TLS Handshake failed: {}", e);
                                 return;
-                            },
+                            }
                             Err(_) => {
                                 eprintln!("TLS Handshake timeout");
                                 return;
                             }
                         }
-                    },
-                    _ => {
-                        Box::new(socket)
                     }
+                    _ => Box::new(socket),
                 };
 
                 serve_connection(
@@ -175,15 +184,12 @@ impl Server {
                     move || {
                         let conn_id = current_channel_connection_id.fetch_add(1, Ordering::Relaxed);
                         let (sender, receiver) = mpsc::channel::<Response>(256);
-                        if let Err(e) = channel_hub.register(conn_id, sender) {
-                            return Err(e);
-                        }
+                        channel_hub.register(conn_id, sender)?;
                         Ok((SocketStatus::Channel(conn_id), receiver))
                     },
-                    move |id| {
-                        channel_hub_disc.disconnect(id)
-                    },
-                ).await;
+                    move |id| channel_hub_disc.disconnect(id),
+                )
+                .await;
             });
         }
 

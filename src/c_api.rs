@@ -1,17 +1,17 @@
 #![allow(non_camel_case_types)]
 
+use crate::config::config::{BigBytesConfig, Config, FramerConfig, TlsConfig};
 use crate::core::commands::{Request, Response, ResponseOpcode};
-use crate::config::config::{BigBytesConfig, Config, FramerConfig};
 use crate::core::handle::ServerHandle;
 use crate::core::router::Router;
-use crate::core::server::{Server};
+use crate::core::server::Server;
 use bytes::Bytes;
-use std::ffi::{c_char, c_void, CStr};
+use std::ffi::{CStr, c_char, c_void};
 use std::net::{IpAddr, SocketAddr};
 use std::ptr;
 use std::str::FromStr;
-use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -66,10 +66,14 @@ pub struct MMA_ServerConfig {
     pub shutdown_grace_ms: u64,
     /// Maximum time allowed for handling one request, in milliseconds.
     pub request_timeout_ms: u64,
+    pub tls_config: *const MMA_TLSConfig,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MMA_TLSConfig {
     pub tls_certificate_path: *const c_char,
     pub tls_key_path: *const c_char,
-    pub tls_enable: bool,
-    pub tls_handshake_timeout: *const u64
+    pub tls_handshake_timeout: u64,
 }
 
 #[repr(C)]
@@ -190,41 +194,37 @@ fn config_from_c(config: &MMA_ServerConfig) -> Option<Config> {
         return None;
     }
 
-    // SAFETY: the public C API requires bind_ip to point to a valid NUL-terminated string.
     let ip_str = unsafe { CStr::from_ptr(config.bind_ip) }.to_str().ok()?;
     let ip_addr = IpAddr::from_str(ip_str).ok()?;
 
-    let cert_path = if config.tls_certificate_path.is_null() {
+    let tls_config = if config.tls_config.is_null() {
         None
     } else {
-        let c_str = unsafe {CStr::from_ptr(config.tls_certificate_path)};
-        match c_str.to_str().map(|s| s.to_owned()) {
-            Ok(c) => Some(c),
-            Err(_) => {
-                return None;
-            }
-        }
-    };
+        let tls_sub = unsafe { &*config.tls_config };
 
-    let key_path = if config.tls_key_path.is_null() {
-        None
-    } else {
-        let c_str = unsafe {CStr::from_ptr(config.tls_key_path)};
-        match c_str.to_str().map(|s| s.to_owned()) {
-            Ok(c) => Some(c),
-            Err(_) => {
-                return None;
-            }
-        }
-    };
+        let cert_path = if tls_sub.tls_certificate_path.is_null() {
+            None
+        } else {
+            let c_str = unsafe { CStr::from_ptr(tls_sub.tls_certificate_path) };
+            c_str.to_str().map(|s| s.to_owned()).ok()
+        };
 
-    let tls_duration = if config.tls_handshake_timeout.is_null() {
-        None
-    } else {
-        match unsafe {config.tls_handshake_timeout.as_ref().copied()} {
-            Some(s) => Some(Duration::from_millis(s)),
-            None => None
+        let key_path = if tls_sub.tls_key_path.is_null() {
+            None
+        } else {
+            let c_str = unsafe { CStr::from_ptr(tls_sub.tls_key_path) };
+            c_str.to_str().map(|s| s.to_owned()).ok()
+        };
+
+        if key_path.is_none() || cert_path.is_none() {
+            return None;
         }
+
+        Some(TlsConfig {
+            tls_certificate_path: cert_path.unwrap(),
+            tls_key_path: key_path.unwrap(),
+            tls_handshake_timeout: Duration::from_millis(tls_sub.tls_handshake_timeout),
+        })
     };
 
     Some(Config {
@@ -236,10 +236,7 @@ fn config_from_c(config: &MMA_ServerConfig) -> Option<Config> {
         drain_timeout: Duration::from_millis(config.drain_timeout_ms),
         shutdown_grace: Duration::from_millis(config.shutdown_grace_ms),
         request_timeout: Duration::from_millis(config.request_timeout_ms),
-        tls_certificate_path: cert_path,
-        tls_key_path: key_path,
-        tls_enable: config.tls_enable,
-        tls_handshake_timeout: tls_duration,
+        tls_config,
     })
 }
 
@@ -304,11 +301,7 @@ fn invoke_c_route(
 
     // The callback is intentionally synchronous, but runs on spawn_blocking's
     // pool rather than on a Tokio async worker thread.
-    let returned = callback(
-        request_view,
-        response_view,
-        user_data as *const c_void,
-    );
+    let returned = callback(request_view, response_view, user_data as *const c_void);
     let returned_ptr = returned.response;
 
     if returned_ptr.is_null() {
@@ -444,13 +437,7 @@ fn router_from_registrations(
                             // If the request times out, the blocking callback keeps
                             // running and continues to occupy this slot.
                             let _permit = permit;
-                            invoke_c_route(
-                                callback,
-                                request,
-                                response,
-                                route_name,
-                                user_data,
-                            )
+                            invoke_c_route(callback, request, response, route_name, user_data)
                         });
 
                         match join.await {
@@ -497,22 +484,20 @@ fn router_from_registrations(
         let user_data = handler.user_data;
         let callback_semaphore = Arc::clone(&c_callback_semaphore);
 
-        router.register_on_channel_connect_handler(
-            move |request: Request, conn_id: u32| {
-                let callback_semaphore = Arc::clone(&callback_semaphore);
-                async move {
-                    run_c_channel_callback(
-                        callback,
-                        request,
-                        conn_id,
-                        user_data,
-                        callback_semaphore,
-                        "on_channel_connect",
-                    )
-                    .await;
-                }
-            },
-        );
+        router.register_on_channel_connect_handler(move |request: Request, conn_id: u32| {
+            let callback_semaphore = Arc::clone(&callback_semaphore);
+            async move {
+                run_c_channel_callback(
+                    callback,
+                    request,
+                    conn_id,
+                    user_data,
+                    callback_semaphore,
+                    "on_channel_connect",
+                )
+                .await;
+            }
+        });
     }
 
     if let Some(handler) = on_channel_disconnect_handler {
@@ -520,22 +505,20 @@ fn router_from_registrations(
         let user_data = handler.user_data;
         let callback_semaphore = Arc::clone(&c_callback_semaphore);
 
-        router.register_on_channel_disconnect_handler(
-            move |request: Request, conn_id: u32| {
-                let callback_semaphore = Arc::clone(&callback_semaphore);
-                async move {
-                    run_c_channel_callback(
-                        callback,
-                        request,
-                        conn_id,
-                        user_data,
-                        callback_semaphore,
-                        "on_channel_disconnect",
-                    )
-                    .await;
-                }
-            },
-        );
+        router.register_on_channel_disconnect_handler(move |request: Request, conn_id: u32| {
+            let callback_semaphore = Arc::clone(&callback_semaphore);
+            async move {
+                run_c_channel_callback(
+                    callback,
+                    request,
+                    conn_id,
+                    user_data,
+                    callback_semaphore,
+                    "on_channel_disconnect",
+                )
+                .await;
+            }
+        });
     }
 
     Ok(router)
@@ -558,9 +541,7 @@ fn response_error() -> MMA_Response {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mma_server_config_default(
-    output: *mut MMA_ServerConfig,
-) -> i32 {
+pub unsafe extern "C" fn mma_server_config_default(output: *mut MMA_ServerConfig) -> i32 {
     if output.is_null() {
         return MMA_INVALID_ARGUMENT;
     }
@@ -576,10 +557,7 @@ pub unsafe extern "C" fn mma_server_config_default(
         drain_timeout_ms: 2_000,
         shutdown_grace_ms: 10_000,
         request_timeout_ms: 10_000,
-        tls_certificate_path: ptr::null(),
-        tls_key_path: ptr::null(),
-        tls_handshake_timeout: ptr::null(),
-        tls_enable: false,
+        tls_config: ptr::null(),
     };
 
     // SAFETY: output was checked for null; caller must provide writable storage.
@@ -624,9 +602,7 @@ pub unsafe extern "C" fn mma_server_create(
         return MMA_INVALID_CONFIG;
     };
 
-    if rust_config.frame_config.validate().is_err()
-        || rust_config.validate().is_err()
-    {
+    if rust_config.frame_config.validate().is_err() || rust_config.validate().is_err() {
         return MMA_INVALID_CONFIG;
     }
 
@@ -731,7 +707,6 @@ pub unsafe extern "C" fn mma_server_register_channel_handler(
     MMA_OK
 }
 
-
 /// Registers the global callback invoked by Router::on_channel_connect.
 /// Calling this again before server start replaces the previous callback.
 #[unsafe(no_mangle)]
@@ -821,8 +796,8 @@ pub unsafe extern "C" fn mma_server_start(server: *mut MMA_Server) -> i32 {
 
     // Bound the number of C callbacks running simultaneously. This semaphore is
     // shared by both route and channel callbacks and does not change the ABI.
-    let c_callback_limit = (config.max_in_flight.max(1) as usize)
-        .min(MMA_MAX_CONCURRENT_C_CALLBACKS);
+    let c_callback_limit =
+        (config.max_in_flight.max(1) as usize).min(MMA_MAX_CONCURRENT_C_CALLBACKS);
     let c_callback_semaphore = Arc::new(Semaphore::new(c_callback_limit));
 
     let router = match router_from_registrations(
@@ -840,8 +815,7 @@ pub unsafe extern "C" fn mma_server_start(server: *mut MMA_Server) -> i32 {
     };
 
     let stop = server.stop.clone();
-    let (ready_tx, ready_rx) =
-        mpsc::sync_channel::<Result<(SocketAddr, ServerHandle), String>>(1);
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(SocketAddr, ServerHandle), String>>(1);
 
     let thread = match thread::Builder::new()
         .name("mma-server".to_owned())
@@ -853,9 +827,8 @@ pub unsafe extern "C" fn mma_server_start(server: *mut MMA_Server) -> i32 {
             {
                 Ok(runtime) => runtime,
                 Err(error) => {
-                    let _ = ready_tx.send(Err(format!(
-                        "Tokio runtime initialization failed: {error}"
-                    )));
+                    let _ =
+                        ready_tx.send(Err(format!("Tokio runtime initialization failed: {error}")));
                     return;
                 }
             };
@@ -872,9 +845,8 @@ pub unsafe extern "C" fn mma_server_start(server: *mut MMA_Server) -> i32 {
                 let local_addr = match listener.local_addr() {
                     Ok(addr) => addr,
                     Err(error) => {
-                        let _ = ready_tx.send(Err(format!(
-                            "Cannot obtain listener address: {error}"
-                        )));
+                        let _ =
+                            ready_tx.send(Err(format!("Cannot obtain listener address: {error}")));
                         return;
                     }
                 };
@@ -882,9 +854,8 @@ pub unsafe extern "C" fn mma_server_start(server: *mut MMA_Server) -> i32 {
                 let mut running_server = match Server::from_listener(config, listener) {
                     Ok(server) => server,
                     Err(error) => {
-                        let _ = ready_tx.send(Err(format!(
-                            "Server initialization failed: {error}"
-                        )));
+                        let _ =
+                            ready_tx.send(Err(format!("Server initialization failed: {error}")));
                         return;
                     }
                 };
@@ -894,10 +865,7 @@ pub unsafe extern "C" fn mma_server_start(server: *mut MMA_Server) -> i32 {
                     return;
                 }
 
-                if let Err(error) = running_server
-                    .run_until(router, stop.cancelled())
-                    .await
-                {
+                if let Err(error) = running_server.run_until(router, stop.cancelled()).await {
                     eprintln!("MMA server stopped after an error: {error}");
                 }
             });
@@ -906,8 +874,7 @@ pub unsafe extern "C" fn mma_server_start(server: *mut MMA_Server) -> i32 {
             // Therefore mma_server_stop may wait past shutdown_grace_ms if a C
             // callback is still executing. A synchronous C function cannot be
             // forcibly interrupted while preserving this ABI.
-        })
-    {
+        }) {
         Ok(thread) => thread,
         Err(error) => {
             eprintln!("Failed to create MMA server thread: {error}");
@@ -1040,10 +1007,7 @@ pub unsafe extern "C" fn mma_server_handle_change_config(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mma_server_local_port(
-    server: *const MMA_Server,
-    port: *mut u16,
-) -> i32 {
+pub unsafe extern "C" fn mma_server_local_port(server: *const MMA_Server, port: *mut u16) -> i32 {
     if server.is_null() || port.is_null() {
         return MMA_INVALID_ARGUMENT;
     }
@@ -1173,10 +1137,9 @@ pub unsafe extern "C" fn mma_response_add_option(
         return response_error();
     }
 
-    response.options.push((
-        Bytes::copy_from_slice(key),
-        Bytes::copy_from_slice(value),
-    ));
+    response
+        .options
+        .push((Bytes::copy_from_slice(key), Bytes::copy_from_slice(value)));
 
     MMA_Response {
         response: response_ptr,

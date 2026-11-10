@@ -36,29 +36,44 @@ jobs:
           CARGO_TERM_COLOR: always
           RUST_BACKTRACE: 1
 
-      - name: Build release libraries
-        run: cargo build --locked --release
+      - name: Build release library
+        run: cargo build --locked --release --lib
         env:
           CARGO_TERM_COLOR: always
 
-      - name: Compile C example against the public API
+      - name: Build both Rust examples
+        run: cargo build --locked --release --examples
+        env:
+          CARGO_TERM_COLOR: always
+
+      - name: Compile both C examples against the public API
         shell: bash
         run: |
           set -euo pipefail
 
-          cc \
-            -std=c11 \
-            -D_POSIX_C_SOURCE=200809L \
-            -Wall -Wextra -Werror \
-            -I include \
-            examples/main_server.c \
-            -L target/release \
-            -Wl,-rpath,"$PWD/target/release" \
-            -lMMA \
-            -pthread \
-            -o target/main_server_c
+          for source in \
+            examples/example_no_tls.c \
+            examples/example_with_tls.c
+          do
+            name="${source##*/}"
+            name="${name%.c}"
 
-          test -x target/main_server_c
+            echo "Compiling ${source}..."
+
+            cc \
+              -std=c11 \
+              -D_POSIX_C_SOURCE=200809L \
+              -Wall -Wextra -Werror \
+              -I include \
+              "$source" \
+              -L target/release \
+              -Wl,-rpath,"$PWD/target/release" \
+              -lMMA \
+              -pthread \
+              -o "target/$name"
+
+            test -x "target/$name"
+          done
 
       - name: Check C++ header compatibility
         shell: bash
@@ -152,7 +167,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build native library
-        run: cargo build --locked --release --target "${{ matrix.target }}"
+        run: cargo build --locked --release --lib --target "${{ matrix.target }}"
 
       - name: Package native library (Windows)
         if: runner.os == 'Windows'
@@ -225,7 +240,6 @@ jobs:
           )
 
           ls -lh "$archive" "$archive.sha256"
-
 
       - name: Upload native package
         uses: actions/upload-artifact@v7.0.2

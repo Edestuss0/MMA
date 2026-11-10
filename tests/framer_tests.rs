@@ -3,8 +3,8 @@ use std::sync::{Arc, RwLock};
 use bytes::{Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
-use MMA::core::commands::{Response, ResponseOpcode};
 use MMA::config::config::FramerConfig;
+use MMA::core::commands::{Response, ResponseOpcode};
 use MMA::protocol::framer::Framer;
 
 fn response(payload: &[u8], options: Vec<(&str, &str)>) -> Response {

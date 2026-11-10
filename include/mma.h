@@ -69,11 +69,14 @@ typedef struct {
     uint64_t shutdown_grace_ms;
     uint64_t request_timeout_ms;
     /* TLS is on only if tls_enable is 1 and the three other fields are set. */
-    const char *tls_certificate_path;
-    const char *tls_key_path;
-    uint8_t tls_enable; /* 0 or 1 only */
-    const uint64_t *tls_handshake_timeout_ms; /* NULL = none; value in ms */
+    const MMA_TLSConfig *tls_config;
 } MMA_ServerConfig;
+
+typedef struct {
+    const char *tls_certificate_path;
+    const char *tls_key_path; 
+    uint64_t tls_handshake_timeout;
+} MMA_TLSConfig;
 
 typedef struct {
     const uint8_t *key;

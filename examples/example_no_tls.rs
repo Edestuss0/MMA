@@ -1,9 +1,9 @@
-use MMA::core::commands::{Request, Response, ResponseOpcode};
 use MMA::config::config::{BigBytesConfig, Config, FramerConfig};
+use MMA::core::commands::{Request, Response, ResponseOpcode};
 use MMA::core::handle::ServerHandle;
-use MMA::core::router::{Router};
-use MMA::core::server::{Server};
-use bytes::{Bytes};
+use MMA::core::router::Router;
+use MMA::core::server::Server;
+use bytes::Bytes;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
@@ -22,7 +22,11 @@ async fn main() {
             payload_order: 1,
             options_key_first: true,
             header_length: 29,
-            big_bytes_config: BigBytesConfig{options_len_order: 1, payload_len_order: 2, req_id_order: 3}
+            big_bytes_config: BigBytesConfig {
+                options_len_order: 1,
+                payload_len_order: 2,
+                req_id_order: 3,
+            },
         },
         max_batch: 65535,
         max_in_flight: 65535,
@@ -30,10 +34,7 @@ async fn main() {
         drain_timeout: Duration::from_secs(2),
         shutdown_grace: Duration::from_secs(10),
         request_timeout: Duration::from_secs(10),
-        tls_certificate_path: None,
-        tls_key_path: None,
-        tls_enable: false,
-        tls_handshake_timeout: None
+        tls_config: None,
     };
 
     let mut router = Router::new();
@@ -82,7 +83,7 @@ async fn main() {
         }
     });
 
-     router.register_on_channel_disconnect_handler({
+    router.register_on_channel_disconnect_handler({
         let handle = handle.clone();
 
         move |req, conn_id| {
@@ -127,7 +128,11 @@ async fn change(_req: Request, res: Response, handle: ServerHandle) -> Response 
             payload_order: 1,
             options_key_first: false,
             header_length: 35,
-            big_bytes_config: BigBytesConfig{options_len_order: 2, payload_len_order: 1, req_id_order: 3}
+            big_bytes_config: BigBytesConfig {
+                options_len_order: 2,
+                payload_len_order: 1,
+                req_id_order: 3,
+            },
         },
         max_batch: 65535,
         max_in_flight: 65535,
@@ -135,10 +140,7 @@ async fn change(_req: Request, res: Response, handle: ServerHandle) -> Response 
         drain_timeout: Duration::from_secs(2),
         shutdown_grace: Duration::from_secs(10),
         request_timeout: Duration::from_secs(10),
-        tls_certificate_path: None,
-        tls_key_path: None,
-        tls_enable: false,
-        tls_handshake_timeout: None
+        tls_config: None,
     };
     let _ = handle.change_config(config);
     res
@@ -178,7 +180,7 @@ async fn send(req: Request, _: u32, handle: ServerHandle) {
 }
 
 async fn disconnect(req: Request, conn_id: u32, handle: ServerHandle) {
-     let payload = match str::from_utf8(&req.payload) {
+    let payload = match str::from_utf8(&req.payload) {
         Ok(v) => v,
         Err(_) => "Invalid data",
     };
@@ -190,7 +192,7 @@ async fn disconnect(req: Request, conn_id: u32, handle: ServerHandle) {
 }
 
 async fn connect(req: Request, conn_id: u32, handle: ServerHandle) {
-     let payload = match str::from_utf8(&req.payload) {
+    let payload = match str::from_utf8(&req.payload) {
         Ok(v) => v,
         Err(_) => "Invalid data",
     };

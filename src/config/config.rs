@@ -5,7 +5,6 @@ use std::{
 
 use crate::config::config::ConfigError::{MaxBatch, MaxConnections, MaxInFlight, Port};
 
-
 #[derive(Debug, Clone)]
 pub struct Config {
     pub address: SocketAddr,
@@ -16,10 +15,14 @@ pub struct Config {
     pub drain_timeout: Duration,
     pub shutdown_grace: Duration,
     pub request_timeout: Duration,
-    pub tls_certificate_path: Option<String>,
-    pub tls_key_path: Option<String>,
-    pub tls_enable: bool,
-    pub tls_handshake_timeout: Option<Duration>
+    pub tls_config: Option<TlsConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsConfig {
+    pub tls_certificate_path: String,
+    pub tls_key_path: String,
+    pub tls_handshake_timeout: Duration,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -47,10 +50,7 @@ impl Default for Config {
             drain_timeout: Duration::from_secs(2),
             shutdown_grace: Duration::from_secs(10),
             request_timeout: Duration::from_secs(10),
-            tls_certificate_path: None,
-            tls_key_path: None,
-            tls_enable: false,
-            tls_handshake_timeout: None
+            tls_config: None,
         }
     }
 }
@@ -103,6 +103,12 @@ pub struct BigBytesConfig {
     pub payload_len_order: u8,
     pub options_len_order: u8,
     pub req_id_order: u8,
+}
+
+impl Default for BigBytesConfig {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BigBytesConfig {

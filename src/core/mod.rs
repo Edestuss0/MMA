@@ -1,6 +1,6 @@
+mod channel_hub;
 pub mod commands;
+pub mod handle;
 pub mod router;
 pub mod server;
-pub mod handle;
-mod channel_hub;
 mod tls;

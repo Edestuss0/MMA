@@ -1,10 +1,8 @@
-use crate::core::{
-    commands::ResponseOpcode::{
-        BadRequest, ChannelConnected, ChannelMessage, Conflict, Forbidden, InternalError, NotFound,
-        Ok, Shutdown, Timeout, Unauthorized,
-    }
-};
 use crate::config::config::MMA_VERSION;
+use crate::core::commands::ResponseOpcode::{
+    BadRequest, ChannelConnected, ChannelMessage, Conflict, Forbidden, InternalError, NotFound, Ok,
+    Shutdown, Timeout, Unauthorized,
+};
 use bytes::Bytes;
 use std::io;
 use thiserror::Error;
@@ -234,7 +232,6 @@ impl Response {
         }
     }
 }
-
 
 #[derive(Debug, Clone, Copy)]
 pub enum SocketStatus {

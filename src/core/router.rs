@@ -1,5 +1,5 @@
-use crate::core::commands::{Request, Response, ResponseHeaders, ResponseOpcode};
 use crate::config::config::MMA_VERSION;
+use crate::core::commands::{Request, Response, ResponseHeaders, ResponseOpcode};
 use crate::core::router::RouteError::{Duplicate, InvalidName};
 use ahash::AHashMap;
 use bytes::Bytes;
@@ -11,6 +11,7 @@ use strum_macros::{Display, EnumString};
 type Handler = Arc<dyn for<'a> Fn(Request, Response) -> BoxFuture<'static, Response> + Send + Sync>;
 type ChannelHandler = Arc<dyn Fn(Request, u32) -> BoxFuture<'static, ()> + Send + Sync>;
 
+#[allow(non_camel_case_types)]
 #[derive(Debug, PartialEq, EnumString, Display)]
 pub enum ReservedRoutes {
     CHANNEL_CONNECT,
@@ -32,7 +33,7 @@ pub struct Router {
     routes: AHashMap<String, Handler>,
     channel_handlers: AHashMap<String, ChannelHandler>,
     on_channel_connect_handler: Option<ChannelHandler>,
-    on_channel_disconnect_handler: Option<ChannelHandler>
+    on_channel_disconnect_handler: Option<ChannelHandler>,
 }
 
 impl Router {
@@ -41,7 +42,7 @@ impl Router {
             routes: AHashMap::new(),
             channel_handlers: AHashMap::new(),
             on_channel_connect_handler: None,
-            on_channel_disconnect_handler: None
+            on_channel_disconnect_handler: None,
         }
     }
     pub fn register_route<F, Fut>(&mut self, route: String, handler: F) -> Result<(), RouteError>
@@ -99,10 +100,7 @@ impl Router {
         Result::Ok(())
     }
 
-    pub fn register_on_channel_connect_handler<F, Fut>(
-        &mut self,
-        handler: F,
-    )
+    pub fn register_on_channel_connect_handler<F, Fut>(&mut self, handler: F)
     where
         F: Fn(Request, u32) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
@@ -114,10 +112,7 @@ impl Router {
         self.on_channel_connect_handler = Some(handler);
     }
 
-    pub fn register_on_channel_disconnect_handler<F, Fut>(
-        &mut self,
-        handler: F,
-    )
+    pub fn register_on_channel_disconnect_handler<F, Fut>(&mut self, handler: F)
     where
         F: Fn(Request, u32) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
@@ -167,20 +162,14 @@ impl Router {
     }
 
     pub async fn on_channel_connect(&self, request: Request, conn_id: u32) {
-        match &self.on_channel_connect_handler {
-            Some(h) => {
-                h(request, conn_id).await;
-            },
-            _ => {}
+        if let Some(h) = &self.on_channel_connect_handler {
+            h(request, conn_id).await;
         };
     }
 
     pub async fn on_channel_disconnect(&self, request: Request, conn_id: u32) {
-        match &self.on_channel_disconnect_handler {
-            Some(h) => {
-                h(request, conn_id).await;
-            },
-            _ => {}
+        if let Some(h) = &self.on_channel_disconnect_handler {
+            h(request, conn_id).await;
         };
     }
 

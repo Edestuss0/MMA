@@ -1,17 +1,23 @@
 use std::sync::Arc;
 use tokio::sync::watch;
 
-use crate::{config::config::Config, core::{channel_hub::ChannelHub, commands::Response, server::Server}};
+use crate::{
+    config::config::Config,
+    core::{channel_hub::ChannelHub, commands::Response, server::Server},
+};
 
 #[derive(Clone)]
 pub struct ServerHandle {
     config_sender: watch::Sender<Config>,
-    channel_hub: Arc<ChannelHub>
+    channel_hub: Arc<ChannelHub>,
 }
 
 impl ServerHandle {
     pub fn new(config_sender: watch::Sender<Config>, channel_hub: Arc<ChannelHub>) -> Self {
-        Self { config_sender, channel_hub }
+        Self {
+            config_sender,
+            channel_hub,
+        }
     }
 
     fn current_config(&self) -> Config {
@@ -24,10 +30,7 @@ impl ServerHandle {
         Server::validate_config(&config)?;
 
         let current = self.current_config();
-        let tls_changed = current.tls_enable != config.tls_enable
-            || current.tls_certificate_path != config.tls_certificate_path
-            || current.tls_key_path != config.tls_key_path
-            || current.tls_handshake_timeout != config.tls_handshake_timeout;
+        let tls_changed = current.tls_config != config.tls_config;
 
         if tls_changed {
             return Err(std::io::Error::new(

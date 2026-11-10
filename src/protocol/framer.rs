@@ -1,9 +1,9 @@
 use std::sync::{Arc, RwLock};
 
+use crate::config::config::{BigBytesConfig, FramerConfig, RESERVED_SUFFIX};
 pub(crate) use crate::core::commands::{
     ProtocolError, Request, RequestHeaders, RequestOpcode, Response, ResponseHeaders,
 };
-use crate::config::config::{self, BigBytesConfig, FramerConfig, RESERVED_SUFFIX};
 use ahash::AHashSet;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
@@ -486,6 +486,6 @@ fn decode_headers(bytes: &[u8], config: &FramerConfig) -> Result<RequestHeaders,
         opcode,
         route_len,
         req_id,
-        options_len: options_len,
+        options_len,
     })
 }
