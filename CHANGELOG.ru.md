@@ -19,11 +19,11 @@
 ### Добавлено
 
 - **TLS (серверная сторона)** на `tokio-rustls` 0.26 / rustls, без клиентских сертификатов. *Rust, ABI*
-  - В `Config` четыре новых поля: `tls_enable: bool`, `tls_certificate_path: Option<String>`, `tls_key_path: Option<String>`, `tls_handshake_timeout: Option<Duration>`. По умолчанию всё выключено/`None`.
-  - В конце `MMA_ServerConfig` четыре новых поля: `tls_certificate_path`, `tls_key_path` (`const char *`), `tls_enable` (`bool`, один байт) и `tls_handshake_timeout` (`const uint64_t *`, миллисекунды; `NULL` = нет). Размер на x86-64 вырос с 64 до 96 байт.
+  - В `Config` добавлено одно поле: `tls_config: Option<TlsConfig>`. `None` отключает TLS; `Some(TlsConfig { tls_certificate_path, tls_key_path, tls_handshake_timeout })` включает TLS.
+  - В C ABI добавлена структура `MMA_TLSConfig` (путь к сертификату, путь к приватному ключу и таймаут рукопожатия в миллисекундах) и одно поле `const MMA_TLSConfig *tls_config` в конце `MMA_ServerConfig`. Размер Rust-структуры `MMA_ServerConfig` с `repr(C)` на x86-64 — 72 байта (вместо 64); размер `MMA_TLSConfig` — 24 байта.
   - Соединение, не прошедшее рукопожатие или не завершившее его за `tls_handshake_timeout`, закрывается и попадает в лог.
   - `ServerHandle::change_config` (и `mma_server_handle_change_config`) отклоняет изменение любого поля TLS: `InvalidInput` в Rust, `MMA_SERVER_ERROR` в C.
-- `examples/example_with_tls.rs` (пути к сертификату и ключу — аргументами) и `examples/example_no_tls.rs`; `example_certs/` с локальным тестовым CA и сертификатом сервера для `localhost`, `127.0.0.1` и `::1` (действует до 2027-11-07).
+- Четыре запускаемых примера сервера: `examples/example_no_tls.rs` и `examples/example_with_tls.rs` для Rust, а также `examples/example_no_tls.c` и `examples/example_with_tls.c` для C ABI. TLS-примеры принимают пути к сертификату и приватному ключу аргументами командной строки. Сертификаты и приватные ключи в репозиторий не включены.
 - В `mma_gui_client.py` появился раздел TLS (транспортная защита, проверка сертификата, имя сервера).
 
 ### Изменено
@@ -33,22 +33,23 @@
   - `ServerHandle` перенесён из `core::server` в `core::handle`. `ChannelHub` теперь приватный; в 0.1.4 он был доступен через `core::server`.
   - `SocketStatus` перенесён из приватного сетевого модуля в `core::commands` и стал публичным.
   - В `Config` четыре новых поля, поэтому литералы структуры без `..Config::default()` больше не компилируются.
-  - `examples/main_server.rs` заменён на `no_tls` и `with_tls`; `cargo run --example main_server` больше не работает.
+  - `examples/main_server.rs` заменён Cargo-примерами `no_tls` и `with_tls`; `cargo run --example main_server` больше не работает. C-примеры находятся в `examples/example_no_tls.c` и `examples/example_with_tls.c` (прежняя ссылка на `examples/main_server.c` устарела).
 - `serve_connection` обобщён по типу потока (`AsyncConnection`: `AsyncRead + AsyncWrite + Unpin + Send`), поэтому TLS и обычный TCP используют один путь кода. Внутреннее изменение.
-- README: TLS, новые пути модулей, 96-байтная `MMA_ServerConfig`, правило про SIGPIPE, поведение дубликата route в C API. Прежнее утверждение, что существует `FramerConfig::new()`, было ошибочным; конструктор — `FramerConfig::default()` (`BigBytesConfig::new()` существует).
+- README: TLS, актуальные имена и команды сборки Rust/C-примеров, все четыре native release target, новые пути модулей, 72-байтная `MMA_ServerConfig`, правило про SIGPIPE и поведение дубликата route в C API. Прежнее утверждение, что существует `FramerConfig::new()`, было ошибочным; конструктор — `FramerConfig::default()` (`BigBytesConfig::new()` существует).
+- **CI и native release pipeline.** При push, pull request и ручном запуске CI выполняет `cargo test --locked --all-targets`, собирает release-библиотеку и оба Rust-примера, компилирует оба C-примера с C11 и `-Wall -Wextra -Werror`, а также проверяет совместимость `mma.h` с C++17. Для тегов `v*` матрица релизной сборки создаёт пакеты Windows x86-64, Linux x86-64, macOS Intel x86-64 и macOS Apple Silicon arm64. Каждый пакет содержит native-библиотеку и `mma.h`; пакет Windows дополнительно содержит import library MSVC. Для архивов создаются SHA-256-файлы, которые проверяются перед публикацией GitHub Release. *Только CI/release; изменений Wire, Rust API и ABI нет.*
 
 ### Известные проблемы
 
 Проверено запуском кода (`cargo build --release`, `cargo test --locked --all-targets`: 14 тестов проходят; живые сессии с `examples/with_tls`, `examples/no_tls` и C-программой, покрывающей все 20 экспортируемых функций).
 
-1. **Ошибка TLS молча отключает TLS.** Если `tls_enable` равно `true`, но сертификат или ключ не загрузились, `Server::new`/`from_listener` и `mma_server_create` + `mma_server_start` завершаются успешно, пишут в stderr `Invalid TLS config: …` и работают по **обычному TCP**. То же происходит, если `tls_enable` равно `true`, но не хватает пути или `tls_handshake_timeout`. Подтверждено: обычный клиент получил нормальные ответы от сервера, запущенного с `/nonexistent.crt`. Предлагаемое исправление: возвращать ошибку из `from_listener` и `mma_server_create`.
-2. **В `include/mma.h` нет новых полей `MMA_ServerConfig`.** Заголовок в дереве по-прежнему описывает структуру в 64 байта, а библиотека пишет и читает 96. Подтверждено: `mma_server_config_default` перезаписала 32 байта после структуры вызывающего (порча стека), а `mma_server_create` читает недостающие поля из того, что лежит дальше. Затронуты `examples/main_server.c`, сборка C-примера в CI и любой C-код, собранный с этим заголовком; CI этого не видит, потому что компилирует с тем же устаревшим заголовком. Исправленный заголовок (`uint8_t tls_enable`, обновлённый комментарий) приложен к этому изменению.
+1. **Ошибки инициализации TLS теперь возвращаются явно.** `Server::from_listener` возвращает `io::Error`, если цепочку сертификатов или приватный ключ не удалось загрузить; C API возвращает `MMA_SERVER_ERROR` из `mma_server_start`. После ошибки инициализации TLS сервер больше не переключается на обычный TCP. *Исправлено в текущем дереве исходников.*
+2. **В `include/mma.h` тип `MMA_TLSConfig` используется до объявления typedef.** `MMA_ServerConfig` содержит `const MMA_TLSConfig *tls_config`, но typedef находится ниже структуры, а предварительного объявления нет. В текущем виде подключение заголовка завершается ошибкой и для C, и для C++; необходимо перенести определение `MMA_TLSConfig` выше `MMA_ServerConfig` либо добавить корректное предварительное объявление именованной структуры. Комментарий над полем также упоминает уже удалённый флаг `tls_enable`: теперь TLS включается наличием ненулевого `tls_config`. C-компиляция примеров и C++ header smoke test в CI будут завершаться ошибкой до исправления заголовка.
 3. **C-хост убивается сигналом `SIGPIPE`.** Запись в сокет, у которого закрыт собеседник, вызывает `SIGPIPE`; C-хост его не игнорирует (Rust-бинарник игнорирует). Подтверждено: процесс-хост завершился со статусом 13, когда отключился клиент с полной очередью push. Обход: `signal(SIGPIPE, SIG_IGN)` до `mma_server_start`. Предлагаемое исправление: игнорировать сигнал внутри библиотеки или отправлять с `MSG_NOSIGNAL`.
 4. В C API дубликат route проходит `mma_server_register_route` (возвращает `MMA_OK`) и падает только в `mma_server_start` с `MMA_SERVER_ERROR`; причина идёт в stderr.
 5. `Config::validate` не проверяет поля TLS.
 6. Комментарий в заголовке говорил, что callbacks выполняются «на worker-потоках рантайма»; на деле они идут в blocking-пуле Tokio (исправлено в приложенном заголовке).
 7. Автотестов на TLS, `ChannelHub`, хуки жизненного цикла и C ABI нет.
-8. Файлы, которые лежат рядом с исходниками, но не в git: `mma_gui_client.py` (на него ссылаются README и запись 0.1.3) и `MMA_Audit_RU.md`. В `example_certs/` лежат приватные ключи (`ca/ca.key`, `server/server.key`); это одноразовые тестовые ключи, но ключ CA в публичном репозитории — плохая привычка, а `.gitignore` его не исключает.
+8. Тестовые TLS credentials не входят в репозиторий. Для запуска обоих TLS-примеров предоставьте сертификат и соответствующий приватный ключ; храните приватные ключи вне репозитория и исключайте их из системы контроля версий.
 9. Оставшиеся известные проблемы 0.1.3 и 0.1.4: пользовательский disconnect-хук не вызывается при обрыве TCP; `send_to_channel(0, ..)` блокируется одним не читающим клиентом; нет лимита запросов на соединение.
 10. Предупреждения компилятора: имя crate `MMA` не в snake case, варианты `ReservedRoutes` в верхнем регистре, два неиспользуемых импорта.
 11. Исходники в CRLF; приложен `.gitattributes` с `* text=auto eol=lf`.

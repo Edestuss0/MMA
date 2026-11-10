@@ -108,7 +108,7 @@ async fn main() -> std::io::Result<()> {
 }
 ```
 
-Готовые примеры: `cargo run --example no_tls` и, с TLS, `cargo run --example with_tls -- example_certs/server/server.crt example_certs/server/server.key` (оба слушают `0.0.0.0:8080`; сертификаты только для локальных тестов).
+В репозитории есть два Rust-примера. Обычный TCP-сервер запускается командой `cargo run --locked --example no_tls`. TLS-сервер принимает пути к PEM-сертификату и приватному ключу: `cargo run --locked --example with_tls -- path/to/server.crt path/to/server.key`. Оба примера слушают `0.0.0.0:8080`. Репозиторий не содержит сертификатов или приватных ключей: для тестирования и развёртывания предоставьте собственные файлы.
 
 ### Минимальный клиент (Python, раскладка по умолчанию)
 
@@ -139,15 +139,31 @@ with socket.create_connection(("127.0.0.1", 8080)) as s:
     print(h[0], recv_exact(s, payload_len))   # 1 b'HELLO'
 ```
 
-### C-сервер
+### Примеры на C
+
+В репозитории есть две реализации сервера на C: `example_no_tls.c` (обычный TCP) и `example_with_tls.c` (TLS). На Linux соберите shared library и оба примера компилятором с поддержкой C11:
 
 ```bash
-cargo build --release
-gcc -std=c11 -Wall -Wextra -pthread -Iinclude examples/main_server.c \
-    -Ltarget/release -lMMA -Wl,-rpath,"$(pwd)/target/release" -o mma_server_c
+cargo build --locked --release --lib
+
+for source in examples/example_no_tls.c examples/example_with_tls.c; do
+    name="$(basename "${source%.c}")"
+    cc \
+        -std=c11 \
+        -D_POSIX_C_SOURCE=200809L \
+        -Wall -Wextra -Werror \
+        -I include \
+        "$source" \
+        -L target/release \
+        -Wl,-rpath,"$PWD/target/release" \
+        -lMMA -pthread \
+        -o "target/$name"
+done
 ```
 
-См. [8. C ABI](#8-c-abi).
+Обычный TCP-пример запускается через `./target/example_no_tls`. TLS-примеру нужны пути к сертификату и приватному ключу: `./target/example_with_tls path/to/server.crt path/to/server.key`. Команды выше используют Linux/GNU linker; для Windows и macOS примените соответствующие параметры компилятора и поиска динамической библиотеки.
+
+Обе C-программы используют публичный заголовок [`include/mma.h`](include/mma.h). См. [8. C ABI](#8-c-abi).
 
 ---
 
@@ -457,7 +473,8 @@ options_key_first = false:  [key_len u16 BE][value_len u16 BE][value][key]
 
 ```rust
 use MMA::config::config::{Config, FramerConfig};
-use std::{net::SocketAddr, time::Duration};
+use std::net::SocketAddr;
+use std::time::Duration;
 
 let config = Config {
     address: SocketAddr::from(([0, 0, 0, 0], 8080)),
@@ -468,10 +485,7 @@ let config = Config {
     drain_timeout: Duration::from_secs(2),
     shutdown_grace: Duration::from_secs(10),
     request_timeout: Duration::from_secs(10),
-    tls_enable: false,
-    tls_certificate_path: None,
-    tls_key_path: None,
-    tls_handshake_timeout: None,
+    tls_config: None,
 };
 config.validate().expect("invalid config");
 ```
@@ -484,29 +498,33 @@ config.validate().expect("invalid config");
 | `max_message_length` (в `FramerConfig`) | 10 000 000 | максимальный размер тела в байтах |
 | `request_timeout` | 10 с | лимит времени обработчика |
 | `drain_timeout` | 2 с | время на отправку накопленных ответов при закрытии соединения |
-| `tls_enable`, `tls_certificate_path`, `tls_key_path`, `tls_handshake_timeout` | выкл. / `None` | TLS, см. ниже |
+| `tls_config` | `None` | необязательная конфигурация TLS-сервера (`TlsConfig`) |
 | `shutdown_grace` | 10 с | ожидание выполняющихся задач при остановке до принудительной отмены |
 
-`Config::validate` отклоняет нулевые лимиты, неверный `FramerConfig` и **порт 0**. Поля TLS он не проверяет.
+`Config::validate` отклоняет нулевые лимиты, неверный `FramerConfig` и **порт 0**. Загрузка сертификата и ключа выполняется при инициализации сервера, а не внутри `Config::validate`.
 
 #### TLS
 
-MMA может сам завершать TLS (rustls, без клиентских сертификатов). Задайте все четыре поля:
+MMA может самостоятельно завершать TLS (rustls, без клиентских сертификатов). Для этого задайте `tls_config: Some(TlsConfig { ... })`; значение `None` отключает TLS:
 
 ```rust
+use MMA::config::config::{Config, TlsConfig};
+use std::time::Duration;
+
 let config = Config {
-    tls_enable: true,
-    tls_certificate_path: Some("server.crt".into()),   // цепочка PEM
-    tls_key_path: Some("server.key".into()),           // приватный ключ PEM
-    tls_handshake_timeout: Some(Duration::from_secs(10)),
+    tls_config: Some(TlsConfig {
+        tls_certificate_path: "server.crt".into(), // цепочка сертификатов PEM
+        tls_key_path: "server.key".into(),         // приватный ключ PEM
+        tls_handshake_timeout: Duration::from_secs(10),
+    }),
     ..Config::default()
 };
 ```
 
-- TLS включён, только если `tls_enable` равно `true` **и** заданы путь к сертификату, путь к ключу и таймаут рукопожатия. Если чего-то не хватает, сервер работает **без TLS и без ошибки**.
-- **Если сертификат или ключ не удалось загрузить, `Server::new` всё равно возвращает успех, пишет в stderr `Invalid TLS config: …` и работает по обычному TCP.** Смотрите лог или проверяйте TLS-клиентом после запуска. Не считайте такое соединение зашифрованным, не проверив.
+- `tls_config: None` отключает TLS. `Some(TlsConfig { ... })` включает его и задаёт путь к сертификату, приватному ключу и таймаут рукопожатия.
+- Если сертификат или ключ не удаётся загрузить, инициализация Rust-сервера возвращает `io::Error`; сервер не переключается молча на обычный TCP. В C API ошибка запуска возвращается как `MMA_SERVER_ERROR`. Проверяйте код возврата и лог сервера.
 - При включённом TLS клиент без шифрования отклоняется на рукопожатии (`TLS Handshake failed`); рукопожатие дольше `tls_handshake_timeout` обрывается.
-- Кадровый протокол внутри TLS-потока не меняется. Клиент сам проверяет сертификат и имя сервера (пример использует `example_certs/ca/ca.crt` и имя `localhost`).
+- Кадровый протокол внутри TLS-потока не меняется. Клиент самостоятельно проверяет цепочку сертификатов сервера и имя узла. Репозиторий не содержит CA bundle; настройте хранилище доверия в соответствии с предоставленным сертификатом.
 - Настройки TLS нельзя менять на работающем сервере: `ServerHandle::change_config` вернёт `InvalidInput` («TLS settings cannot be changed while server is running»), если любое поле TLS отличается.
 
 ### 7.3. Обработчики
@@ -615,7 +633,16 @@ router.register_on_channel_disconnect_handler(|req: Request, conn_id: u32| async
 
 ## 8. C ABI
 
-Заголовок: [`include/mma.h`](include/mma.h). Готовые пакеты прикрепляются к каждому GitHub Release для тегов `v*` (Windows x86-64, Linux x86-64, macOS x86-64 и arm64): библиотека, `mma.h` и, для Windows, импортная библиотека MSVC, к каждому архиву — файл `.sha256`. Библиотека: `libMMA.so` / `libMMA.dylib` / `MMA.dll` и `libMMA.a` в `target/release/` после `cargo build --release`. Проверено только на Linux x86-64.
+Заголовок: [`include/mma.h`](include/mma.h). Для каждого тега `v*` GitHub Release получает четыре native-пакета. Каждый архив содержит динамическую библиотеку и `mma.h`; архив Windows дополнительно включает импортную библиотеку MSVC. Рядом с каждым архивом публикуется файл контрольной суммы `.sha256`.
+
+| Платформа | Release asset |
+|---|---|
+| Windows x86-64 | `mma-native-windows-amd64.zip` |
+| Linux x86-64 | `mma-native-linux-amd64.zip` |
+| macOS Intel x86-64 | `mma-native-darwin-amd64.zip` |
+| macOS Apple Silicon arm64 | `mma-native-darwin-arm64.zip` |
+
+Локальная команда `cargo build --release` создаёт `libMMA.so` / `libMMA.dylib` / `MMA.dll` и `libMMA.a` в `target/release/`. Проверки заголовка C/C++ в текущем workflow выявляют описанную ниже проблему с порядком объявления `MMA_TLSConfig`; до исправления заголовка они не пройдут. В проекте подтверждена native-сборка только для Linux x86-64.
 
 ### 8.1. Функции
 
@@ -641,20 +668,25 @@ router.register_on_channel_disconnect_handler(|req: Request, conn_id: u32| async
 | `mma_response_set_payload` | задаёт payload (копируется) | |
 | `mma_response_add_option` | добавляет option (копируется) | key/value непустые, ≤ 65535 байт, ≤ 255 options |
 
-`MMA_ServerConfig` заканчивается четырьмя полями TLS:
+Настройки TLS вынесены в отдельную структуру `MMA_TLSConfig`; `MMA_ServerConfig` хранит указатель на неё:
 
 ```c
 typedef struct {
+    const char *tls_certificate_path;
+    const char *tls_key_path;
+    uint64_t tls_handshake_timeout; /* миллисекунды */
+} MMA_TLSConfig;
+
+typedef struct {
     /* ... bind_ip, port, max_batch, max_in_flight, framer, max_connections,
        drain_timeout_ms, shutdown_grace_ms, request_timeout_ms ... */
-    const char     *tls_certificate_path;   /* NULL = нет */
-    const char     *tls_key_path;           /* NULL = нет */
-    uint8_t         tls_enable;             /* только 0 или 1 */
-    const uint64_t *tls_handshake_timeout_ms; /* NULL = нет; указывает на значение в мс */
+    const MMA_TLSConfig *tls_config; /* NULL = обычный TCP */
 } MMA_ServerConfig;
 ```
 
-Rust-сторона ожидает именно такую раскладку (96 байт на x86-64). В заголовке эти поля обязаны быть: C-программа, собранная с заголовком без них, позволит `mma_server_config_default` записать 32 байта за пределами своей `MMA_ServerConfig`. Правила те же, что в Rust: TLS активен, только когда `tls_enable` равно 1 и заданы остальные три поля, а нечитаемый сертификат или ключ не приводят к ошибке `mma_server_start` (сервер работает по обычному TCP и печатает `Invalid TLS config` в stderr).
+Создайте `MMA_TLSConfig` до вызова `mma_server_create`, затем задайте `config.tls_config = &tls_config`. `mma_server_config_default` устанавливает указатель в `NULL`. Размер Rust-структуры `MMA_ServerConfig` с `repr(C)` на x86-64 — 72 байта, а `MMA_TLSConfig` — 24 байта. Библиотека копирует строки сертификата и ключа во время `mma_server_create`, поэтому локальную структуру и строки можно освободить после возврата вызова. Если сертификат или ключ не удаётся загрузить, `mma_server_start` возвращает `MMA_SERVER_ERROR`, а не запускает обычный TCP.
+
+> **Текущая проблема заголовка:** в этой версии `include/mma.h` использует `MMA_TLSConfig` внутри `MMA_ServerConfig` до объявления typedef. Порядок объявлений в примере выше является правильным: перенесите typedef `MMA_TLSConfig` выше `MMA_ServerConfig` (либо добавьте корректное предварительное объявление именованной структуры). В заголовке также остался устаревший комментарий с `tls_enable`; теперь TLS включается ненулевым указателем `tls_config`. Пока заголовок не исправлен, компиляция C-примеров и C++ header smoke test в CI будет завершаться ошибкой.
 
 ### 8.2. Коды ошибок
 
@@ -725,13 +757,13 @@ Route-callback — **функциональный**: получает пусто
 - `create` → регистрация маршрутов → `start` → … → `stop` → `destroy`.
 - Не вызывайте `start`, `stop`, `destroy` конкурентно для одного указателя и не используйте указатель после `destroy`. Библиотека не обнаруживает double-free и use-after-free.
 - `mma_server_stop` завершает поток сервера и ждёт его. При уничтожении runtime дожидаются уже запущенные C-callbacks, поэтому `stop` может длиться дольше `shutdown_grace`, пока callback не вернулся. Синхронную C-функцию прервать нельзя.
-- Строки в `MMA_ServerConfig` (`bind_ip`, пути TLS) и значение за `tls_handshake_timeout_ms` читаются и копируются внутри `mma_server_create` и `mma_server_handle_change_config`; после этого их можно освободить.
+- Строка `bind_ip` в `MMA_ServerConfig` и строки сертификата/ключа в переданной структуре `MMA_TLSConfig` читаются и копируются внутри `mma_server_create` и `mma_server_handle_change_config`; их можно освободить после возврата этих вызовов.
 - **В C-хосте игнорируйте `SIGPIPE`** (`signal(SIGPIPE, SIG_IGN)`) до запуска сервера. Библиотека пишет в сокеты обычным `write`; если клиент закрыл соединение, пока сервер ещё отправляет данные, действие `SIGPIPE` по умолчанию завершает весь процесс. Rust-программы не затронуты: рантайм Rust игнорирует этот сигнал. Наблюдалось: C-хост завершился со статусом 13, когда отключился клиент с полной очередью push.
 - `mma_server_handle_change_config`: новые `FramerConfig` и `request_timeout` подхватываются соединениями; `max_batch`, `max_connections`, `max_in_flight`, адрес listener и `shutdown_grace` **не** обновляются. Смена wire-параметров без одновременного переключения клиентов ломает разбор.
 
 ### 8.7. Пример
 
-Полный пример — [`examples/main_server.c`](examples/main_server.c) (маршруты `GET`, `POW`, channel-handler `SEND`, обработка сигналов, handle сервера).
+Полные примеры на C — [`examples/example_no_tls.c`](examples/example_no_tls.c) и [`examples/example_with_tls.c`](examples/example_with_tls.c). Они демонстрируют один и тот же API маршрутов и каналов поверх обычного TCP и TLS, включая хуки жизненного цикла соединения, обработку сигналов и управление `MMA_ServerHandle`. TLS-пример принимает пути к сертификату и приватному ключу аргументами командной строки.
 
 ```c
 #include "mma.h"
@@ -756,7 +788,7 @@ Wire-раскладка задаётся через `config.framer` (`MMA_Framer
 |---|---|---|
 | Wire-протокол | `MMA_VERSION = 1` | повышается при несовместимых изменениях кадра или семантики |
 | Rust crate | `0.1.0` в `Cargo.toml` (git-теги доходят до `v0.1.4`) | до 1.0 breaking-изменения возможны в любом релизе; изменились пути модулей и API push (см. [CHANGELOG.ru.md](CHANGELOG.ru.md)) |
-| C ABI / `mma.h` | без версии | `MMA_ServerConfig` получила в конце четыре поля TLS (32 байта): пересоберите весь C-код с новым заголовком; `mma_server_handle_send_to_channel` не ждёт; запроса версии в рантайме нет |
+| C ABI / `mma.h` | без версии | `MMA_ServerConfig` содержит поле `const MMA_TLSConfig *tls_config`; размер Rust-структуры `repr(C)` на x86-64 — 72 байта. Пересоберите C-код с соответствующим заголовком; `mma_server_handle_send_to_channel` не ждёт; запроса версии в рантайме нет |
 
 Два участника совместимы по wire, только если совпадают `MMA_VERSION` **и** весь `FramerConfig`. Замечание: правило зарезервированного route для `ChannelConnect` ([§5.5](#55-зарезервированные-маршруты-и-хуки-жизненного-цикла-соединения)) меняет семантику запроса, не меняя раскладку кадра и `MMA_VERSION`; см. [CHANGELOG.ru.md](CHANGELOG.ru.md). Новые opcode или обязательное поле требуют новой `MMA_VERSION`; старый сервер закрывает соединение при неизвестном opcode запроса.
 
@@ -764,8 +796,8 @@ Wire-раскладка задаётся через `config.framer` (`MMA_Framer
 
 ## 10. Безопасность
 
-- **TLS необязателен и только на стороне сервера** (см. [§7.2](#72-конфигурация)); нет клиентской аутентификации, аутентификации на уровне приложения и защиты от replay. Без TLS всё, включая раскладку, читается в сети. Конфигурация раскладки — обфускация и не является секретом, если не распространяется как секрет. Неверный сертификат или ключ молча отключает TLS (см. §7.2): после каждого развёртывания проверяйте, что TLS-рукопожатие проходит.
-- В `example_certs/` лежат одноразовые CA и ключ сервера для локальных тестов. Не используйте их в production и не публикуйте собственные приватные ключи.
+- **TLS необязателен и только на стороне сервера** (см. [§7.2](#72-конфигурация)); нет клиентской аутентификации, аутентификации на уровне приложения и защиты от replay. Без TLS всё, включая раскладку, читается в сети. Конфигурация раскладки — обфускация, а не механизм безопасности. Если сертификат или ключ не удаётся загрузить, инициализация сервера завершается ошибкой; незашифрованный TCP вместо TLS не запускается.
+- Репозиторий не содержит сертификатов и приватных ключей. При запуске TLS-примера предоставьте сертификат и соответствующий приватный ключ. Для локального тестирования используйте отдельные тестовые credentials; не добавляйте production-ключи в репозиторий и не распространяйте их.
 - Считайте все поля от клиента недоверенными. UTF-8 проверяется только у `route`; payload и options — сырые байты.
 
 | Лимит | Значение |
@@ -793,9 +825,9 @@ Wire-раскладка задаётся через `config.framer` (`MMA_Framer
 | `src/core/` | `commands` (Request/Response, `SocketStatus`), `router` (маршруты, обработчики, хуки жизненного цикла), `server`, `handle` (`ServerHandle`), `channel_hub` и `tls` (приватные) |
 | `src/c_api.rs` | экспорты C ABI |
 | `include/mma.h` | C-заголовок |
-| `examples/example_no_tls.rs`, `examples/example_with_tls.rs`, `examples/main_server.c` | Rust-серверы без TLS и с TLS (показывают и connect/disconnect-хуки) и C-сервер |
-| `example_certs/` | тестовые CA и сертификат сервера для `example_with_tls.rs` (не для production) |
+| `examples/example_no_tls.rs`, `examples/example_with_tls.rs` | примеры сервера на Rust без TLS и с TLS; оба показывают обработчики маршрутов и каналов, а также хуки жизненного цикла соединения |
+| `examples/example_no_tls.c`, `examples/example_with_tls.c` | примеры сервера через C ABI без TLS и с TLS; TLS-пример принимает пути к сертификату и приватному ключу |
 | `mma_gui_client.py` | тестовый клиент на Tkinter (стандартная библиотека Python): настраиваемая раскладка, все три opcode, самотест кодека |
-| `.github/workflows/native-release.yml` | CI на каждый push (тесты Rust, C-пример с `-Werror`, проверка заголовка из C++); на тегах `v*` собирает нативные пакеты и публикует Release |
-| `CHANGELOG.md`, `CHANGELOG.ru.md` | история изменений с влиянием на wire / Rust API / C ABI |
+| `.github/workflows/native-release.yml` | CI при push, pull request и ручном запуске: тесты Rust, сборка release-библиотеки и примеров, компиляция обоих C-примеров с `-Werror`, проверка заголовка из C++. На тегах `v*` собирает четыре native-пакета (Windows x86-64, Linux x86-64, macOS x86-64 и macOS arm64), проверяет SHA-256 и публикует GitHub Release |
+| `CHANGELOG.md`, `CHANGELOG.ru.md` | история изменений на английском и русском с влиянием на wire / Rust API / C ABI |
 | `tests/` | тесты конфигурации (тесты кодека сейчас отключены) |

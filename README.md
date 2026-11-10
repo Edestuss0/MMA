@@ -107,7 +107,7 @@ async fn main() -> std::io::Result<()> {
 }
 ```
 
-Bundled examples: `cargo run --example no_tls` and, with TLS, `cargo run --example with_tls -- example_certs/server/server.crt example_certs/server/server.key` (both listen on `0.0.0.0:8080`; the certificates are for local tests only).
+The repository includes two Rust examples. Run the plain TCP server with `cargo run --locked --example no_tls`. The TLS server accepts a PEM certificate and private-key path: `cargo run --locked --example with_tls -- path/to/server.crt path/to/server.key`. Both examples listen on `0.0.0.0:8080`. The repository does not include a production certificate or private key; provide your own test or deployment credentials.
 
 ### Minimal client (Python, default layout)
 
@@ -138,15 +138,31 @@ with socket.create_connection(("127.0.0.1", 8080)) as s:
     print(h[0], recv_exact(s, payload_len))   # 1 b'HELLO'
 ```
 
-### C server
+### C examples
+
+The repository contains two C implementations of the same server: `example_no_tls.c` (plain TCP) and `example_with_tls.c` (TLS). Build the shared library and both examples on Linux with a C11 compiler:
 
 ```bash
-cargo build --release
-gcc -std=c11 -Wall -Wextra -pthread -Iinclude examples/main_server.c \
-    -Ltarget/release -lMMA -Wl,-rpath,"$(pwd)/target/release" -o mma_server_c
+cargo build --locked --release --lib
+
+for source in examples/example_no_tls.c examples/example_with_tls.c; do
+    name="$(basename "${source%.c}")"
+    cc \
+        -std=c11 \
+        -D_POSIX_C_SOURCE=200809L \
+        -Wall -Wextra -Werror \
+        -I include \
+        "$source" \
+        -L target/release \
+        -Wl,-rpath,"$PWD/target/release" \
+        -lMMA -pthread \
+        -o "target/$name"
+done
 ```
 
-See [8. C ABI](#8-c-abi).
+Run the plain TCP example with `./target/example_no_tls`. The TLS example requires paths to a certificate and private key: `./target/example_with_tls path/to/server.crt path/to/server.key`. The commands above use the Linux/GNU linker; use the corresponding compiler and dynamic-library search-path options on Windows or macOS.
+
+Both C programs use the public header [`include/mma.h`](include/mma.h). See [8. C ABI](#8-c-abi).
 
 ---
 
@@ -456,7 +472,8 @@ Public modules: `MMA::config::config` (`Config`, `FramerConfig`, `BigBytesConfig
 
 ```rust
 use MMA::config::config::{Config, FramerConfig};
-use std::{net::SocketAddr, time::Duration};
+use std::net::SocketAddr;
+use std::time::Duration;
 
 let config = Config {
     address: SocketAddr::from(([0, 0, 0, 0], 8080)),
@@ -467,10 +484,7 @@ let config = Config {
     drain_timeout: Duration::from_secs(2),
     shutdown_grace: Duration::from_secs(10),
     request_timeout: Duration::from_secs(10),
-    tls_enable: false,
-    tls_certificate_path: None,
-    tls_key_path: None,
-    tls_handshake_timeout: None,
+    tls_config: None,
 };
 config.validate().expect("invalid config");
 ```
@@ -483,29 +497,33 @@ config.validate().expect("invalid config");
 | `max_message_length` (in `FramerConfig`) | 10 000 000 | maximum body size in bytes |
 | `request_timeout` | 10 s | handler time limit |
 | `drain_timeout` | 2 s | time to flush pending responses when a connection closes |
-| `tls_enable`, `tls_certificate_path`, `tls_key_path`, `tls_handshake_timeout` | off / `None` | TLS, see below |
+| `tls_config` | `None` | optional TLS server configuration (`TlsConfig`) |
 | `shutdown_grace` | 10 s | time to wait for running tasks on shutdown before forced cancellation |
 
-`Config::validate` rejects zero limits, an invalid `FramerConfig` and **port 0**. It does not look at the TLS fields.
+`Config::validate` rejects zero limits, an invalid `FramerConfig` and **port 0**. TLS certificate/key loading happens during server initialization, not in `Config::validate`.
 
 #### TLS
 
-MMA can terminate TLS itself (rustls, no client certificates). Set all four fields:
+MMA can terminate TLS itself (rustls, without client certificates). Set `tls_config` to `Some(TlsConfig { ... })`; use `None` for plain TCP:
 
 ```rust
+use MMA::config::config::{Config, TlsConfig};
+use std::time::Duration;
+
 let config = Config {
-    tls_enable: true,
-    tls_certificate_path: Some("server.crt".into()),   // PEM chain
-    tls_key_path: Some("server.key".into()),           // PEM private key
-    tls_handshake_timeout: Some(Duration::from_secs(10)),
+    tls_config: Some(TlsConfig {
+        tls_certificate_path: "server.crt".into(), // PEM certificate chain
+        tls_key_path: "server.key".into(),         // PEM private key
+        tls_handshake_timeout: Duration::from_secs(10),
+    }),
     ..Config::default()
 };
 ```
 
-- TLS is on only if `tls_enable` is `true` **and** the certificate path, the key path and the handshake timeout are all set. If any of them is missing, the server runs **without TLS and without an error**.
-- **If the certificate or the key cannot be loaded, `Server::new` still succeeds, prints `Invalid TLS config: …` to stderr and serves plain TCP.** Check the log, or test with a TLS client after start. Do not rely on this configuration to be encrypted without checking.
+- `tls_config: None` disables TLS. `Some(TlsConfig { ... })` enables it and supplies the certificate path, private-key path and handshake timeout together.
+- If the certificate or key cannot be loaded, Rust server initialization returns an `io::Error`; the server does not silently fall back to plain TCP. In the C API, startup reports `MMA_SERVER_ERROR`. Check this result and the server log.
 - With TLS on, a plain-text client is rejected during the handshake (`TLS Handshake failed`); a handshake that takes longer than `tls_handshake_timeout` is dropped.
-- The frame protocol runs unchanged inside the TLS stream. A client must verify the server certificate and name itself (the example uses `example_certs/ca/ca.crt` and the name `localhost`).
+- The frame protocol runs unchanged inside the TLS stream. A client must verify the server certificate chain and server name itself. The repository does not provide a CA bundle; configure the trust store appropriate for the certificate you supply.
 - TLS settings cannot change while the server runs: `ServerHandle::change_config` returns `InvalidInput` ("TLS settings cannot be changed while server is running") if any TLS field differs.
 
 ### 7.3. Handlers
@@ -614,7 +632,16 @@ Shutdown: accepting stops, readers stop, running handlers get `shutdown_grace`, 
 
 ## 8. C ABI
 
-Header: [`include/mma.h`](include/mma.h). Prebuilt packages are attached to each GitHub Release for `v*` tags (Windows x86-64, Linux x86-64, macOS x86-64 and arm64): the library, `mma.h` and, on Windows, the MSVC import library, with a `.sha256` file for each archive. Library: `libMMA.so` / `libMMA.dylib` / `MMA.dll` and `libMMA.a` in `target/release/` after `cargo build --release`. Verified on Linux x86-64 only.
+Header: [`include/mma.h`](include/mma.h). For each `v*` tag, GitHub Releases receive four native packages. Each archive includes the shared library and `mma.h`; the Windows archive also includes the MSVC import library. A `.sha256` checksum file is published beside every archive.
+
+| Platform | Release asset |
+|---|---|
+| Windows x86-64 | `mma-native-windows-amd64.zip` |
+| Linux x86-64 | `mma-native-linux-amd64.zip` |
+| macOS Intel x86-64 | `mma-native-darwin-amd64.zip` |
+| macOS Apple Silicon arm64 | `mma-native-darwin-arm64.zip` |
+
+A local `cargo build --release` produces `libMMA.so` / `libMMA.dylib` / `MMA.dll` and `libMMA.a` in `target/release/`. The checked-in workflow's C/C++ header validation currently exposes the `MMA_TLSConfig` declaration-order issue described below; the header must be fixed before those checks pass. Native build verification documented by the project is Linux x86-64 only.
 
 ### 8.1. Functions
 
@@ -640,20 +667,25 @@ Header: [`include/mma.h`](include/mma.h). Prebuilt packages are attached to each
 | `mma_response_set_payload` | set the payload (copied) | |
 | `mma_response_add_option` | add an option (copied) | non-empty key/value, ≤ 65535 bytes, ≤ 255 options |
 
-`MMA_ServerConfig` ends with four TLS fields:
+TLS settings are grouped in `MMA_TLSConfig`; `MMA_ServerConfig` contains a pointer to that structure:
 
 ```c
 typedef struct {
+    const char *tls_certificate_path;
+    const char *tls_key_path;
+    uint64_t tls_handshake_timeout; /* milliseconds */
+} MMA_TLSConfig;
+
+typedef struct {
     /* ... bind_ip, port, max_batch, max_in_flight, framer, max_connections,
        drain_timeout_ms, shutdown_grace_ms, request_timeout_ms ... */
-    const char     *tls_certificate_path;   /* NULL = none */
-    const char     *tls_key_path;           /* NULL = none */
-    uint8_t         tls_enable;             /* 0 or 1 only */
-    const uint64_t *tls_handshake_timeout_ms; /* NULL = none; points to a value in ms */
+    const MMA_TLSConfig *tls_config; /* NULL = plain TCP */
 } MMA_ServerConfig;
 ```
 
-The Rust side expects exactly this layout (96 bytes on x86-64). The header must contain these fields: a C program built against a header without them lets `mma_server_config_default` write 32 bytes past its `MMA_ServerConfig`. The same rules as for Rust apply: TLS is active only when `tls_enable` is 1 and all three other fields are set, and an unreadable certificate or key does not make `mma_server_start` fail (it serves plain TCP and prints `Invalid TLS config` to stderr).
+Initialize `MMA_TLSConfig` before calling `mma_server_create`, then set `config.tls_config = &tls_config`. `mma_server_config_default` sets this pointer to `NULL`. The Rust `repr(C)` layout of `MMA_ServerConfig` is 72 bytes on x86-64; `MMA_TLSConfig` is 24 bytes. The library copies certificate/key strings while `mma_server_create` runs, so the local `MMA_TLSConfig` and its strings may be released after the call returns. If certificate/key loading fails, `mma_server_start` reports `MMA_SERVER_ERROR` rather than starting a plain TCP server.
+
+> **Current header issue:** in this source snapshot, `include/mma.h` uses `MMA_TLSConfig` in `MMA_ServerConfig` before declaring the typedef. The declaration order shown above is the required order: move the `MMA_TLSConfig` typedef above `MMA_ServerConfig` (or add a valid named forward declaration). The header also contains an obsolete comment mentioning `tls_enable`; TLS is now enabled by setting `tls_config` to a non-`NULL` pointer. Until the header is corrected, the C examples and the C++ header smoke test in CI will fail to compile.
 
 ### 8.2. Error codes
 
@@ -724,13 +756,13 @@ Rules:
 - `create` → register routes → `start` → … → `stop` → `destroy`.
 - Do not call `start`, `stop` or `destroy` concurrently on the same pointer, and do not use a pointer after `destroy`. The library cannot detect double-free or use-after-free.
 - `mma_server_stop` makes the server thread exit and joins it. Dropping the runtime waits for C callbacks that are already running, so `stop` can take longer than `shutdown_grace` while a callback has not returned. A synchronous C function cannot be interrupted.
-- The strings in `MMA_ServerConfig` (`bind_ip`, TLS paths) and the value behind `tls_handshake_timeout_ms` are read and copied inside `mma_server_create` and `mma_server_handle_change_config`; they may be freed afterwards.
+- The strings in `MMA_ServerConfig` (`bind_ip`) and in the pointed-to `MMA_TLSConfig` (certificate and key paths) are read and copied inside `mma_server_create` and `mma_server_handle_change_config`; they may be freed after those calls return.
 - **Ignore `SIGPIPE` in a C host** (`signal(SIGPIPE, SIG_IGN)`) before starting the server. The library writes to sockets with the ordinary `write`; when a client closes a connection while the server is still sending, the default action of `SIGPIPE` kills the whole process. Rust programs are not affected, because the Rust runtime ignores the signal. Observed: a C host died with exit status 13 when a client with a full push queue disconnected.
 - `mma_server_handle_change_config`: new `FramerConfig` and `request_timeout` are picked up by connections; `max_batch`, `max_connections`, `max_in_flight`, the listen address and `shutdown_grace` are **not** updated. Changing wire parameters without switching clients at the same time breaks parsing.
 
 ### 8.7. Example
 
-The full example is [`examples/main_server.c`](examples/main_server.c) (routes `GET`, `POW`, channel handler `SEND`, signal handling, server handle).
+The complete C examples are [`examples/example_no_tls.c`](examples/example_no_tls.c) and [`examples/example_with_tls.c`](examples/example_with_tls.c). They demonstrate the same route/channel API over plain TCP and TLS, including lifecycle hooks, signal handling and `MMA_ServerHandle` management. The TLS example takes the certificate and private-key paths as command-line arguments.
 
 ```c
 #include "mma.h"
@@ -755,7 +787,7 @@ Three versions are independent:
 |---|---|---|
 | Wire protocol | `MMA_VERSION = 1` | bumped on incompatible frame or semantics changes |
 | Rust crate | `0.1.0` in `Cargo.toml` (git tags go up to `v0.1.4`) | before 1.0, breaking changes may occur in any release; module paths and the push API changed (see [CHANGELOG.md](CHANGELOG.md)) |
-| C ABI / `mma.h` | unversioned | `MMA_ServerConfig` grew by four TLS fields at the end (32 bytes): recompile all C code against the new header; `mma_server_handle_send_to_channel` is non-waiting; no runtime version query |
+| C ABI / `mma.h` | unversioned | `MMA_ServerConfig` now contains a `const MMA_TLSConfig *tls_config` field; on x86-64 its Rust `repr(C)` size is 72 bytes. Recompile C code against the matching header; `mma_server_handle_send_to_channel` is non-waiting; no runtime version query |
 
 Two peers are wire-compatible only if `MMA_VERSION` **and** the whole `FramerConfig` match. Note: the reserved-route rule for `ChannelConnect` ([§5.5](#55-reserved-routes-and-connection-lifecycle-hooks)) changes request semantics without changing the frame layout or `MMA_VERSION`; see [CHANGELOG.md](CHANGELOG.md). Adding opcodes or a mandatory field requires a new `MMA_VERSION`; an old server closes the connection on an unknown request opcode.
 
@@ -763,8 +795,8 @@ Two peers are wire-compatible only if `MMA_VERSION` **and** the whole `FramerCon
 
 ## 10. Security
 
-- **TLS is optional and server-side only** (see [§7.2](#72-configuration)); there is no client authentication, no application-level authentication and no replay protection. Without TLS everything, including the layout, is readable on the wire. The layout configuration is obfuscation and is not a secret unless distributed as one. A bad certificate or key silently turns TLS off (see §7.2): verify that a TLS handshake works after every deployment.
-- `example_certs/` holds a throw-away CA and server key for local tests. Never use them in production and do not publish your own private keys.
+- **TLS is optional and server-side only** (see [§7.2](#72-configuration)); there is no client authentication, no application-level authentication and no replay protection. Without TLS everything, including the layout, is readable on the wire. The layout configuration is obfuscation and is not a security mechanism. If the configured certificate or key cannot be loaded, server initialization fails; it does not silently fall back to plain TCP.
+- The repository does not ship certificates or private keys. Supply a certificate and matching private key when running a TLS example. Use dedicated test credentials for local testing; never commit or distribute production private keys.
 - Treat every field from the client as untrusted. Only `route` is UTF-8-validated; payload and options are raw bytes.
 
 | Limit | Value |
@@ -791,9 +823,9 @@ Not covered yet: idle/read/write timeouts (slow-client attacks), a global byte b
 | `src/core/` | `commands` (Request/Response, `SocketStatus`), `router` (routes, handlers, lifecycle hooks), `server`, `handle` (`ServerHandle`), `channel_hub` and `tls` (private) |
 | `src/c_api.rs` | C ABI exports |
 | `include/mma.h` | C header |
-| `examples/example_no_tls.rs`, `examples/example_with_tls.rs`, `examples/main_server.c` | Rust servers without and with TLS (they also show the connect/disconnect hooks) and a C server |
-| `example_certs/` | test CA and server certificate for `example_with_tls.rs` (not for production) |
+| `examples/example_no_tls.rs`, `examples/example_with_tls.rs` | Rust server examples without and with TLS; both demonstrate route/channel handlers and connection lifecycle hooks |
+| `examples/example_no_tls.c`, `examples/example_with_tls.c` | C ABI server examples without and with TLS; the TLS example accepts certificate and private-key paths |
 | `mma_gui_client.py` | Tkinter test client (Python standard library): configurable layout, all three opcodes, a codec self-test |
-| `.github/workflows/native-release.yml` | CI on every push (Rust tests, C example compiled with `-Werror`, C++ header check); on `v*` tags it builds the native packages and publishes the Release |
-| `CHANGELOG.md` | history of changes with wire / Rust API / C ABI impact |
+| `.github/workflows/native-release.yml` | CI on pushes, pull requests and manual dispatch: Rust tests, release library and example builds, both C examples compiled with `-Werror`, and a C++ header check. On `v*` tags it builds four native packages (Windows x86-64, Linux x86-64, macOS x86-64 and macOS arm64), verifies SHA-256 files and publishes a GitHub Release |
+| `CHANGELOG.md`, `CHANGELOG.ru.md` | English and Russian history of changes with wire / Rust API / C ABI impact |
 | `tests/` | configuration tests (codec tests are currently disabled) |
