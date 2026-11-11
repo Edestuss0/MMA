@@ -17,10 +17,11 @@ pub struct Framer {
 
 impl Framer {
     pub fn new(cfg: Arc<RwLock<FramerConfig>>) -> Self {
+        let config = cfg.read().expect("lock poisoned").clone();
         Self {
             config: cfg,
             cached_header: None,
-            cached_config: None,
+            cached_config: Some(config),
         }
     }
 }
@@ -36,14 +37,19 @@ impl Encoder<Response> for Framer {
             });
         }
 
-        let config = self
-            .config
-            .read()
-            .expect("Framer config lock poisoned")
-            .clone();
+        let config = match &self.cached_config {
+            Some(config) => config.clone(),
+            None => self
+                .config
+                .read()
+                .expect("Framer config lock poisoned")
+                .clone(),
+        };
 
         let hlen = config.header_length as usize;
         let frame_start = dst.len();
+        let estimated_len = hlen + item.payload.len() + item.options.iter().map(|(k, v)| 4 + k.len() + v.len()).sum::<usize>();
+        dst.reserve(estimated_len);
         dst.resize(frame_start + hlen, 0);
 
         let option_length;
@@ -173,7 +179,7 @@ impl Decoder for Framer {
         let _hdr = src.split_to(config.header_length as usize);
 
         let mut payload = Bytes::new();
-        let mut route = String::new();
+        let mut route = String::with_capacity(headers.payload_len as usize);
         let mut options: Vec<(Bytes, Bytes)> = Vec::with_capacity(headers.options_count as usize);
 
         for i in 1..=3 {
@@ -212,8 +218,6 @@ fn encode_options(
 ) -> Result<u32, ProtocolError> {
     let start = dst.len();
 
-    let mut validate_set = AHashSet::<&[u8]>::with_capacity(options.len());
-
     for (key, value) in options {
         if key.is_empty() || value.is_empty() {
             return Err(ProtocolError::InvalidFrame {
@@ -225,13 +229,6 @@ fn encode_options(
         if key.len() > u16::MAX as usize || value.len() > u16::MAX as usize {
             return Err(ProtocolError::InvalidFrame {
                 message: "Option too large",
-                req_id,
-            });
-        }
-
-        if !validate_set.insert(key) {
-            return Err(ProtocolError::InvalidFrame {
-                message: "Duplicate option key",
                 req_id,
             });
         }
@@ -267,12 +264,11 @@ fn decode_options(
             });
         }
 
-        return Ok(Vec::new());
+        return Ok(Vec::with_capacity(0));
     }
 
     let mut raw = raw.freeze();
     let mut options = Vec::with_capacity(count);
-    let mut validate_set = AHashSet::<Bytes>::with_capacity(count);
 
     for _ in 0..count {
         if raw.len() < MIN_OPTION_LENGTH {
@@ -307,13 +303,6 @@ fn decode_options(
             let value = raw.split_to(value_len);
             let key = raw.split_to(key_len);
             (key, value)
-        };
-
-        if !validate_set.insert(key.clone()) {
-            return Err(ProtocolError::InvalidFrame {
-                message: "Duplicate option key",
-                req_id,
-            });
         };
 
         options.push((key, value));

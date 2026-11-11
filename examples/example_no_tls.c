@@ -1,467 +1,320 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include "mma.h"
 
-#include <inttypes.h>
-#include <limits.h>
-#include <pthread.h>
+#include <errno.h>
 #include <signal.h>
-#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
-/* Тайм-ауты задаются в миллисекундах. */
-#define MMA_DRAIN_TIMEOUT_MS 2000ULL
-#define MMA_SHUTDOWN_GRACE_MS 10000ULL
-#define MMA_REQUEST_TIMEOUT_MS 10000ULL
+static volatile sig_atomic_t g_stop_requested = 0;
 
-typedef struct {
-    pthread_mutex_t mutex;
-    pthread_cond_t ready;
-    MMA_ServerHandle *handle;
-    bool initialized;
-} ChannelContext;
-
-static ChannelContext channel_context = {
-    .mutex = PTHREAD_MUTEX_INITIALIZER,
-    .ready = PTHREAD_COND_INITIALIZER,
-    .handle = NULL,
-    .initialized = false
-};
-
-static void publish_channel_handle(MMA_ServerHandle *handle)
+static void handle_signal(int signal_number)
 {
-    pthread_mutex_lock(&channel_context.mutex);
-    channel_context.handle = handle;
-    channel_context.initialized = true;
-    pthread_cond_broadcast(&channel_context.ready);
-    pthread_mutex_unlock(&channel_context.mutex);
+    (void)signal_number;
+    g_stop_requested = 1;
 }
 
-static MMA_Response get_route(
-    MMA_Request request,
-    MMA_Response response,
-    const void *user_data
-)
+static int register_route(
+    MMA_Server *server,
+    const char *name,
+    MMA_AsyncRouteCallback callback)
 {
-    (void)user_data;
-
-    response = mma_response_set_status(response, MMA_RESPONSE_OK);
-    if (response.inner == NULL) {
-        return response;
-    }
-
-    return mma_response_set_payload(
-        response,
-        request.payload,
-        request.payload_len
-    );
-}
-
-/* Возведение в степень по модулю 2^32. */
-static uint32_t wrapping_pow(int32_t base, uint32_t exponent)
-{
-    uint32_t result = 1;
-    uint32_t factor = (uint32_t)base;
-
-    while (exponent > 0) {
-        if ((exponent & 1U) != 0U) {
-            result *= factor;
-        }
-
-        exponent >>= 1U;
-
-        if (exponent > 0) {
-            factor *= factor;
-        }
-    }
-
-    return result;
-}
-
-static MMA_Response pow_route(
-    MMA_Request request,
-    MMA_Response response,
-    const void *user_data
-)
-{
-    (void)user_data;
-
-    int32_t number = 1;
-
-    if (request.payload != NULL &&
-        request.payload_len > 0 &&
-        request.payload_len < 64) {
-        char buffer[64];
-
-        memcpy(buffer, request.payload, request.payload_len);
-        buffer[request.payload_len] = '\0';
-
-        char *end = NULL;
-        long parsed = strtol(buffer, &end, 10);
-
-        if (end != buffer &&
-            *end == '\0' &&
-            parsed >= INT32_MIN &&
-            parsed <= INT32_MAX) {
-            number = (int32_t)parsed;
-        }
-    }
-
-    uint32_t exponent = 2;
-
-    for (size_t i = 0;
-         request.options != NULL && i < request.options_count;
-         ++i) {
-        const MMA_Option *option = &request.options[i];
-
-        if (option->key == NULL || option->value == NULL) {
-            continue;
-        }
-
-        if (option->key_len == 3 &&
-            memcmp(option->key, "pow", 3) == 0 &&
-            option->value_len > 0 &&
-            option->value_len < 32) {
-            char buffer[32];
-
-            memcpy(buffer, option->value, option->value_len);
-            buffer[option->value_len] = '\0';
-
-            char *end = NULL;
-            unsigned long parsed = strtoul(buffer, &end, 10);
-
-            if (end != buffer &&
-                *end == '\0' &&
-                buffer[0] != '-' &&
-                parsed <= UINT32_MAX) {
-                exponent = (uint32_t)parsed;
-            }
-
-            break;
-        }
-    }
-
-    char payload[64];
-
-    int payload_len = snprintf(
-        payload,
-        sizeof(payload),
-        "%" PRId32 "^%" PRIu32 " = %" PRIu32,
-        number,
-        exponent,
-        wrapping_pow(number, exponent)
-    );
-
-    if (payload_len < 0 ||
-        (size_t)payload_len >= sizeof(payload)) {
-        return response;
-    }
-
-    response = mma_response_set_status(response, MMA_RESPONSE_OK);
-    if (response.inner == NULL) {
-        return response;
-    }
-
-    return mma_response_set_payload(
-        response,
-        (const uint8_t *)payload,
-        (size_t)payload_len
+    return mma_server_register_async_route(
+        server,
+        (const uint8_t *)name,
+        strlen(name),
+        callback,
+        NULL
     );
 }
 
 /*
- * Обработчик ChannelMessage для маршрута SEND.
- * Payload входящего запроса рассылается всем подписчикам
- * посредством conn_id == 0.
+ * Route callbacks are short and non-blocking. Request data is borrowed
+ * for the duration of the callback, so response_set_payload() copies it
+ * before we complete the request.
  */
-static int32_t send_channel(
-    const MMA_Request *request,
-    uint32_t connection_id,
-    const void *user_data
-)
+static void complete_request(
+    MMA_AsyncRequest *request,
+    uint32_t request_id,
+    const uint8_t *payload,
+    size_t payload_len)
 {
-    (void)connection_id;
-
-    if (request == NULL || user_data == NULL) {
-        return MMA_INVALID_ARGUMENT;
+    MMA_Response *response = mma_response_new(request_id);
+    if (response == NULL) {
+        fprintf(stderr, "mma_response_new failed\n");
+        return; /* The request will finish through timeout/cancellation. */
     }
 
-    if (request->payload_len > 0 && request->payload == NULL) {
-        return MMA_INVALID_ARGUMENT;
+    int32_t rc = mma_response_set_status(response, MMA_RESPONSE_OK);
+    if (rc != MMA_OK) {
+        fprintf(stderr, "mma_response_set_status: %d\n", (int)rc);
+        mma_response_destroy(response);
+        return;
     }
 
-    ChannelContext *context = (ChannelContext *)user_data;
-
-    if (pthread_mutex_lock(&context->mutex) != 0) {
-        return MMA_SERVER_ERROR;
+    rc = mma_response_set_payload(response, payload, payload_len);
+    if (rc != MMA_OK) {
+        fprintf(stderr, "mma_response_set_payload: %d\n", (int)rc);
+        mma_response_destroy(response);
+        return;
     }
 
-    while (!context->initialized) {
-        int wait_result =
-            pthread_cond_wait(&context->ready, &context->mutex);
-
-        if (wait_result != 0) {
-            pthread_mutex_unlock(&context->mutex);
-            return MMA_SERVER_ERROR;
-        }
-    }
-
-    MMA_ServerHandle *handle = context->handle;
-    pthread_mutex_unlock(&context->mutex);
-
-    if (handle == NULL) {
-        return MMA_SERVER_ERROR;
-    }
-
-    MMA_Response message = mma_response_new(request->request_id);
-
-    if (message.inner == NULL) {
-        return MMA_SERVER_ERROR;
-    }
-
-    MMA_Response updated = mma_response_set_status(
-        message,
-        MMA_RESPONSE_MESSAGE
-    );
-
-    if (updated.inner == NULL) {
-        mma_response_destroy(message);
-        return MMA_SERVER_ERROR;
-    }
-
-    message = updated;
-
-    updated = mma_response_set_payload(
-        message,
-        request->payload,
-        request->payload_len
-    );
-
-    if (updated.inner == NULL) {
-        mma_response_destroy(message);
-        return MMA_SERVER_ERROR;
-    }
-
-    message = updated;
-
-    int32_t result = mma_server_handle_send_to_channel(
-        handle,
-        0,
-        message
-    );
-
-    /* send_to_channel должен клонировать Response. */
-    mma_response_destroy(message);
-
-    return result;
-}
-
-static int32_t register_routes(MMA_Server *server)
-{
-    static const uint8_t get_name[] = "GET";
-    static const uint8_t pow_name[] = "POW";
-    static const uint8_t send_name[] = "SEND";
-
-    int32_t result = mma_server_register_route(
-        server,
-        get_name,
-        sizeof(get_name) - 1,
-        get_route,
-        NULL
-    );
-
-    if (result != MMA_OK) {
-        fprintf(stderr, "Could not register GET route: %d\n", result);
-        return result;
-    }
-
-    result = mma_server_register_route(
-        server,
-        pow_name,
-        sizeof(pow_name) - 1,
-        pow_route,
-        NULL
-    );
-
-    if (result != MMA_OK) {
-        fprintf(stderr, "Could not register POW route: %d\n", result);
-        return result;
-    }
-
-    result = mma_server_register_channel_handler(
-        server,
-        send_name,
-        sizeof(send_name) - 1,
-        send_channel,
-        &channel_context
-    );
-
-    if (result != MMA_OK) {
-        fprintf(stderr, "Could not register SEND handler: %d\n", result);
-        return result;
-    }
-
-    return MMA_OK;
-}
-
-int main(void)
-{
     /*
-     * C-хост обязан игнорировать SIGPIPE: иначе закрытие сокета клиентом
-     * во время отправки завершит весь процесс.
+     * For a valid route request, complete() consumes response:
+     *   MMA_OK                       -> sent to the waiting connection
+     *   MMA_REQUEST_ALREADY_COMPLETED -> consumed, do not destroy
+     *   MMA_REQUEST_CANCELLED         -> consumed, do not destroy
+     *
+     * INVALID_ARGUMENT means ownership was not transferred. This should
+     * not occur for a request delivered to this route callback.
      */
-    signal(SIGPIPE, SIG_IGN);
+    rc = mma_async_request_complete(request, response);
+    if (rc == MMA_INVALID_ARGUMENT) {
+        mma_response_destroy(response);
+    } else if (rc != MMA_OK &&
+               rc != MMA_REQUEST_ALREADY_COMPLETED &&
+               rc != MMA_REQUEST_CANCELLED) {
+        fprintf(stderr, "mma_async_request_complete: %d\n", (int)rc);
+    }
+}
 
-    sigset_t signal_set;
+static void echo_route(
+    MMA_AsyncRequest *request,
+    void *user_data)
+{
+    (void)user_data;
 
-    if (sigemptyset(&signal_set) != 0 ||
-        sigaddset(&signal_set, SIGINT) != 0 ||
-        sigaddset(&signal_set, SIGTERM) != 0) {
-        perror("Could not configure signal set");
-        return EXIT_FAILURE;
+    MMA_RequestInfo info;
+    int32_t rc = mma_async_request_get_info(request, &info);
+    if (rc != MMA_OK) {
+        fprintf(stderr, "echo: get_info failed: %d\n", (int)rc);
+        return;
     }
 
-    int mask_result = pthread_sigmask(SIG_BLOCK, &signal_set, NULL);
+    complete_request(
+        request,
+        info.request_id,
+        info.payload,
+        info.payload_len
+    );
+}
 
-    if (mask_result != 0) {
-        fprintf(
-            stderr,
-            "Could not block termination signals: %s\n",
-            strerror(mask_result)
-        );
-        return EXIT_FAILURE;
+static void health_route(
+    MMA_AsyncRequest *request,
+    void *user_data)
+{
+    (void)user_data;
+
+    MMA_RequestInfo info;
+    int32_t rc = mma_async_request_get_info(request, &info);
+    if (rc != MMA_OK) {
+        fprintf(stderr, "health: get_info failed: %d\n", (int)rc);
+        return;
     }
 
+    static const uint8_t body[] = "ok";
+    complete_request(
+        request,
+        info.request_id,
+        body,
+        sizeof(body) - 1
+    );
+}
+
+/*
+ * Channel callbacks are notifications, not request/response routes.
+ * Do not call mma_async_request_complete() here.
+ */
+static void chat_channel(
+    MMA_AsyncRequest *request,
+    uint32_t connection_id,
+    void *user_data)
+{
+    (void)user_data;
+
+    MMA_RequestInfo info;
+    int32_t rc = mma_async_request_get_info(request, &info);
+    if (rc != MMA_OK) {
+        fprintf(stderr, "channel %u: get_info failed: %d\n",
+                (unsigned)connection_id, (int)rc);
+        return;
+    }
+
+    fprintf(stdout, "[channel %u] ", (unsigned)connection_id);
+    if (info.payload_len != 0) {
+        (void)fwrite(info.payload, 1, info.payload_len, stdout);
+    }
+    fputc('\n', stdout);
+    fflush(stdout);
+}
+
+static void channel_connected(
+    MMA_AsyncRequest *request,
+    uint32_t connection_id,
+    void *user_data)
+{
+    (void)request;
+    (void)user_data;
+    fprintf(stdout, "[channel] connected: %u\n",
+            (unsigned)connection_id);
+    fflush(stdout);
+}
+
+static void channel_disconnected(
+    MMA_AsyncRequest *request,
+    uint32_t connection_id,
+    void *user_data)
+{
+    (void)request;
+    (void)user_data;
+    fprintf(stdout, "[channel] disconnected: %u\n",
+            (unsigned)connection_id);
+    fflush(stdout);
+}
+
+static int parse_port(const char *text, uint16_t *port_out)
+{
+    char *end = NULL;
+    errno = 0;
+    unsigned long value = strtoul(text, &end, 10);
+
+    if (errno != 0 || end == text || *end != '\0' ||
+        value == 0 || value > UINT16_MAX) {
+        return 0;
+    }
+
+    *port_out = (uint16_t)value;
+    return 1;
+}
+
+static int run_server(
+    uint16_t port,
+    const MMA_TLSConfig *tls_config)
+{
     MMA_ServerConfig config;
-
-    int32_t result = mma_server_config_default(&config);
-
-    if (result != MMA_OK) {
-        fprintf(
-            stderr,
-            "Could not initialize server configuration: %d\n",
-            result
-        );
-        return EXIT_FAILURE;
+    int32_t rc = mma_server_config_default(&config);
+    if (rc != MMA_OK) {
+        fprintf(stderr, "mma_server_config_default: %d\n", (int)rc);
+        return 1;
     }
 
     config.bind_ip = "0.0.0.0";
-    config.port = 8080;
-    config.max_batch = 65535;
-    config.max_in_flight = 65535;
-    config.max_connections = 128000;
-
-    config.drain_timeout_ms = MMA_DRAIN_TIMEOUT_MS;
-    config.shutdown_grace_ms = MMA_SHUTDOWN_GRACE_MS;
-    config.request_timeout_ms = MMA_REQUEST_TIMEOUT_MS;
-
-    config.framer.opcode_pos = 1;
-    config.framer.version_pos = 4;
-    config.framer.max_message_length = 10 * 1000 * 1000;
-    config.framer.route_len_pos = 6;
-    config.framer.options_count_pos = 7;
-    config.framer.route_order = 3;
-    config.framer.options_order = 2;
-    config.framer.payload_order = 1;
-    config.framer.options_key_first = 1;
-    config.framer.header_length = 29;
-
-    /* TLS выключен: tls_enable = 0, остальные поля TLS равны NULL. */
-    config.tls_config = NULL;
+    config.port = port;
+    config.tls_config = tls_config;
 
     MMA_Server *server = NULL;
-
-    result = mma_server_create(&config, &server);
-
-    if (result != MMA_OK || server == NULL) {
-        fprintf(stderr, "Could not create server: %d\n", result);
-        return EXIT_FAILURE;
+    rc = mma_server_create(&config, &server);
+    if (rc != MMA_OK || server == NULL) {
+        fprintf(stderr, "mma_server_create: %d\n", (int)rc);
+        return 1;
     }
 
-    result = register_routes(server);
+    int started = 0;
+    int exit_code = 1;
+    uint16_t actual_port = port;
+    struct sigaction action;
 
-    if (result != MMA_OK) {
-        mma_server_destroy(server);
-        return EXIT_FAILURE;
+    rc = register_route(server, "echo", echo_route);
+    if (rc != MMA_OK) {
+        fprintf(stderr, "register route echo: %d\n", (int)rc);
+        goto cleanup;
     }
 
-    result = mma_server_start(server);
-
-    if (result != MMA_OK) {
-        fprintf(stderr, "Could not start server: %d\n", result);
-
-        publish_channel_handle(NULL);
-        mma_server_destroy(server);
-
-        return EXIT_FAILURE;
+    rc = register_route(server, "health", health_route);
+    if (rc != MMA_OK) {
+        fprintf(stderr, "register route health: %d\n", (int)rc);
+        goto cleanup;
     }
 
-    MMA_ServerHandle *handle = NULL;
-
-    result = mma_server_get_handle(server, &handle);
-
-    /*
-     * Публикуем результат даже при ошибке, чтобы callback,
-     * ожидающий condition variable, не завис навсегда.
-     */
-    publish_channel_handle(
-        result == MMA_OK ? handle : NULL
+    rc = mma_server_register_async_channel_handler(
+        server,
+        (const uint8_t *)"chat",
+        sizeof("chat") - 1,
+        chat_channel,
+        NULL
     );
-
-    if (result != MMA_OK || handle == NULL) {
-        fprintf(stderr, "Could not get server handle: %d\n", result);
-
-        mma_server_stop(server);
-        mma_server_destroy(server);
-
-        return EXIT_FAILURE;
+    if (rc != MMA_OK) {
+        fprintf(stderr, "register channel handler chat: %d\n", (int)rc);
+        goto cleanup;
     }
 
-    uint16_t port = 0;
-
-    result = mma_server_local_port(server, &port);
-
-    if (result != MMA_OK) {
-        fprintf(stderr, "Could not get server port: %d\n", result);
-
-        mma_server_stop(server);
-        publish_channel_handle(NULL);
-        mma_server_handle_destroy(handle);
-        mma_server_destroy(server);
-
-        return EXIT_FAILURE;
+    rc = mma_server_register_async_on_channel_connect_handler(
+        server, channel_connected, NULL
+    );
+    if (rc != MMA_OK) {
+        fprintf(stderr, "register connect handler: %d\n", (int)rc);
+        goto cleanup;
     }
 
-    printf("Listening on %s:%u (без TLS)\n", config.bind_ip, (unsigned)port);
-    printf("MMA channel broadcast is ready.\n");
+    rc = mma_server_register_async_on_channel_disconnect_handler(
+        server, channel_disconnected, NULL
+    );
+    if (rc != MMA_OK) {
+        fprintf(stderr, "register disconnect handler: %d\n", (int)rc);
+        goto cleanup;
+    }
+
+    rc = mma_server_start(server);
+    if (rc != MMA_OK) {
+        fprintf(stderr, "mma_server_start: %d\n", (int)rc);
+        goto cleanup;
+    }
+    started = 1;
+
+    rc = mma_server_local_port(server, &actual_port);
+    if (rc != MMA_OK) {
+        fprintf(stderr, "mma_server_local_port: %d\n", (int)rc);
+        goto cleanup;
+    }
+
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = handle_signal;
+    sigemptyset(&action.sa_mask);
+    (void)sigaction(SIGINT, &action, NULL);
+    (void)sigaction(SIGTERM, &action, NULL);
+
+    printf("MMA server listening on %s:%u\n",
+           config.bind_ip, (unsigned)actual_port);
+    printf("Routes: echo, health; channel handler: chat\n");
+    printf("Press Ctrl+C to stop.\n");
     fflush(stdout);
 
-    int received_signal = 0;
-    int wait_result = sigwait(&signal_set, &received_signal);
-
-    if (wait_result != 0) {
-        fprintf(stderr, "sigwait failed: %s\n", strerror(wait_result));
-    } else {
-        printf("Received signal %d; shutting down...\n", received_signal);
+    while (!g_stop_requested) {
+        (void)sleep(1);
     }
 
-    result = mma_server_stop(server);
+    exit_code = 0;
 
-    if (result != MMA_OK) {
-        fprintf(stderr, "Could not stop server cleanly: %d\n", result);
+cleanup:
+    if (started) {
+        int32_t stop_rc = mma_server_stop(server);
+        if (stop_rc != MMA_OK) {
+            fprintf(stderr, "mma_server_stop: %d\n", (int)stop_rc);
+            exit_code = 1;
+        }
     }
 
-    /*
-     * После остановки потока сервера callback больше не должен
-     * обращаться к MMA_ServerHandle.
-     */
-    publish_channel_handle(NULL);
-
-    mma_server_handle_destroy(handle);
     mma_server_destroy(server);
+    return exit_code;
+}
 
-    return (wait_result == 0 && result == MMA_OK)
-        ? EXIT_SUCCESS
-        : EXIT_FAILURE;
+int main(int argc, char **argv)
+{
+    uint16_t port = 9090;
+
+    if (argc > 2) {
+        fprintf(stderr, "Usage: %s [port]\n", argv[0]);
+        return 2;
+    }
+
+    if (argc == 2 && !parse_port(argv[1], &port)) {
+        fprintf(stderr, "Invalid port: %s\n", argv[1]);
+        return 2;
+    }
+
+    return run_server(port, NULL);
 }
