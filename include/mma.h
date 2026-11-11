@@ -58,6 +58,12 @@ typedef struct {
 } MMA_FramerConfig;
 
 typedef struct {
+    const char *tls_certificate_path;
+    const char *tls_key_path; 
+    uint64_t tls_handshake_timeout;
+} MMA_TLSConfig;
+
+typedef struct {
     const char *bind_ip;
     uint16_t port;
     uint32_t max_batch;
@@ -71,12 +77,6 @@ typedef struct {
     /* TLS is on only if tls_enable is 1 and the three other fields are set. */
     const MMA_TLSConfig *tls_config;
 } MMA_ServerConfig;
-
-typedef struct {
-    const char *tls_certificate_path;
-    const char *tls_key_path; 
-    uint64_t tls_handshake_timeout;
-} MMA_TLSConfig;
 
 typedef struct {
     const uint8_t *key;

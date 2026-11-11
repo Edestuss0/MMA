@@ -50,6 +50,13 @@ pub struct MMA_BigBytesConfig {
     pub payload_len_order: u8,
     pub req_id_order: u8,
 }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MMA_TLSConfig {
+    pub tls_certificate_path: *const c_char,
+    pub tls_key_path: *const c_char,
+    pub tls_handshake_timeout: u64,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -67,13 +74,6 @@ pub struct MMA_ServerConfig {
     /// Maximum time allowed for handling one request, in milliseconds.
     pub request_timeout_ms: u64,
     pub tls_config: *const MMA_TLSConfig,
-}
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct MMA_TLSConfig {
-    pub tls_certificate_path: *const c_char,
-    pub tls_key_path: *const c_char,
-    pub tls_handshake_timeout: u64,
 }
 
 #[repr(C)]
