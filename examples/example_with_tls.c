@@ -328,10 +328,6 @@ int main(int argc, char **argv)
         fclose(file);
     }
 
-    /* Значение читается и копируется внутри mma_server_create. */
-    static const uint64_t tls_handshake_timeout_ms =
-        MMA_TLS_HANDSHAKE_TIMEOUT_MS;
-
     /*
      * C-хост обязан игнорировать SIGPIPE: иначе закрытие сокета клиентом
      * во время отправки завершит весь процесс.
