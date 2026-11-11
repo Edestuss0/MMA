@@ -381,14 +381,9 @@ int main(int argc, char **argv)
     config.shutdown_grace_ms = MMA_SHUTDOWN_GRACE_MS;
     config.request_timeout_ms = MMA_REQUEST_TIMEOUT_MS;
 
-     MMA_TLSConfig tls_sub_config;
-    tls_sub_config.tls_certificate_path = argv[1];
-    tls_sub_config.tls_key_path = argv[2];
-    tls_sub_config.tls_handshake_timeout = MMA_TLS_HANDSHAKE_TIMEOUT_MS;
-
     config.framer.opcode_pos = 1;
     config.framer.version_pos = 4;
-    config.framer.max_message_length = 10 * 1000 * 1000;
+    config.framer.max_message_length = 10000000;
     config.framer.route_len_pos = 6;
     config.framer.options_count_pos = 7;
     config.framer.route_order = 3;
@@ -402,7 +397,7 @@ int main(int argc, char **argv)
     tls_sub_config.tls_key_path = argv[2];
     tls_sub_config.tls_handshake_timeout = MMA_TLS_HANDSHAKE_TIMEOUT_MS;
 
-    config.tls_config = tls_sub_config;
+    config.tls_config = &tls_sub_config;
 
     MMA_Server *server = NULL;
 
