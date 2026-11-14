@@ -58,7 +58,6 @@ pub async fn serve_connection<S, F, T>(
     let (tx, rx) = tokio::sync::mpsc::channel::<Response>(1000);
     let inflight = TaskTracker::new();
 
-    let conn_semaphore = Arc::new(Semaphore::new(1));
     let tx_copy = tx.clone();
 
     let on_channel_connect = Arc::new(on_channel_connect);
@@ -127,12 +126,6 @@ pub async fn serve_connection<S, F, T>(
                 let tx_for_channel = tx_copy.clone();
 
                 let disconnect = disconnect.clone();
-                let permit = match Arc::clone(&conn_semaphore).acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => {
-                        continue;
-                    }
-                };
 
                 let socket_status_disc = Arc::clone(&socket_status);
                 let on_channel_disconnect = Arc::clone(&on_channel_disconnect);
@@ -144,7 +137,6 @@ pub async fn serve_connection<S, F, T>(
                             cmd,
                             socket_status,
                             permit_global,
-                            permit,
                             router,
                             Arc::new(move || -> (SocketStatus, Option<u32>) {
                                 let (status, mut receiver) = match on_channel_connect() {
@@ -277,7 +269,6 @@ async fn handle_cmd<F, T>(
     cmd: Request,
     socket_status: Arc<AtomicU64>,
     permit: OwnedSemaphorePermit,
-    status_permit: OwnedSemaphorePermit,
     router: Arc<Router>,
     on_channel_connect: Arc<F>,
     on_channel_disconnect: Arc<T>,
@@ -297,7 +288,7 @@ where
     match status {
         SocketStatus::Fresh => match cmd.headers.opcode {
             RequestOpcode::Once => {
-                if change_socket_status(SocketStatus::Once, socket_status, status_permit)
+                if change_socket_status(SocketStatus::Fresh, SocketStatus::Once, socket_status)
                     .await
                     .is_err()
                 {
@@ -321,7 +312,6 @@ where
                     let conn_id = match id {
                         Some(id) => id,
                         None => {
-                            drop(status_permit);
                             drop(permit);
 
                             return Some(Response::internal_error(req_id));
@@ -329,7 +319,6 @@ where
                     };
 
                     if !matches!(status, SocketStatus::Channel(id) if id == conn_id) {
-                        drop(status_permit);
                         drop(permit);
 
                         return Some(Response::internal_error(req_id));
@@ -340,7 +329,7 @@ where
                         .await
                         .is_err()
                     {
-                        if change_socket_status(status, socket_status, status_permit)
+                        if change_socket_status(SocketStatus::Fresh, status, socket_status,)
                             .await
                             .is_err()
                         {
@@ -353,7 +342,7 @@ where
                         return Some(Response::internal_error(req_id));
                     }
 
-                    if change_socket_status(status, socket_status, status_permit)
+                    if change_socket_status(SocketStatus::Fresh, status, socket_status,)
                         .await
                         .is_err()
                     {
@@ -365,7 +354,6 @@ where
 
                     return Some(Response::channel_connected(req_id));
                 } else {
-                    drop(status_permit);
                     drop(permit);
 
                     return Some(Response::bad_request(
@@ -375,7 +363,6 @@ where
                 }
             }
             RequestOpcode::ChannelMessage => {
-                drop(status_permit);
                 drop(permit);
                 return Some(Response::bad_request(
                     req_id,
@@ -384,7 +371,6 @@ where
             }
         },
         SocketStatus::Once => {
-            drop(status_permit);
             match cmd.headers.opcode {
                 RequestOpcode::Once => {
                     let response = match AssertUnwindSafe(router.handle(cmd)).catch_unwind().await {
@@ -403,7 +389,6 @@ where
             }
         }
         SocketStatus::Channel(conn_id) => {
-            drop(status_permit);
             match cmd.headers.opcode {
                 RequestOpcode::ChannelConnect => {
                     drop(permit);
@@ -563,11 +548,12 @@ where
 }
 
 async fn change_socket_status(
+    old: SocketStatus,
     new: SocketStatus,
     status: Arc<AtomicU64>,
-    permit: OwnedSemaphorePermit,
 ) -> Result<(), ()> {
-    status.store(SocketStatus::to_u64(new), Ordering::Relaxed);
-    drop(permit);
+    if status.compare_exchange(SocketStatus::to_u64(old), SocketStatus::to_u64(new), Ordering::Relaxed,  Ordering::Relaxed).is_err() {
+        return Err(())
+    };
     Ok(())
 }
