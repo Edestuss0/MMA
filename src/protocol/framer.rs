@@ -4,7 +4,6 @@ use crate::config::config::{BigBytesConfig, FramerConfig, RESERVED_SUFFIX};
 pub(crate) use crate::core::commands::{
     ProtocolError, Request, RequestHeaders, RequestOpcode, Response, ResponseHeaders,
 };
-use ahash::AHashSet;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
@@ -48,7 +47,13 @@ impl Encoder<Response> for Framer {
 
         let hlen = config.header_length as usize;
         let frame_start = dst.len();
-        let estimated_len = hlen + item.payload.len() + item.options.iter().map(|(k, v)| 4 + k.len() + v.len()).sum::<usize>();
+        let estimated_len = hlen
+            + item.payload.len()
+            + item
+                .options
+                .iter()
+                .map(|(k, v)| 4 + k.len() + v.len())
+                .sum::<usize>();
         dst.reserve(estimated_len);
         dst.resize(frame_start + hlen, 0);
 

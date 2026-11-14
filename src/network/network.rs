@@ -189,9 +189,10 @@ pub async fn serve_connection<S, F, T>(
                                     socket_status_disc.load(Ordering::Relaxed),
                                 );
                                 if let SocketStatus::Channel(id) = status
-                                    && let Err(e) = on_channel_disconnect(id) {
-                                        eprintln!("Error with channel disconnecting: {}", e);
-                                    };
+                                    && let Err(e) = on_channel_disconnect(id)
+                                {
+                                    eprintln!("Error with channel disconnecting: {}", e);
+                                };
                                 disconnect.cancel();
                             }),
                         ),
@@ -243,18 +244,20 @@ pub async fn serve_connection<S, F, T>(
     let status = SocketStatus::from_u64(socket_status.load(Ordering::Relaxed));
 
     if let SocketStatus::Channel(id) = status
-        && let Err(e) = on_channel_disconnect(id) {
-            eprintln!("Error with channel disconnect: {e}");
-        }
+        && let Err(e) = on_channel_disconnect(id)
+    {
+        eprintln!("Error with channel disconnect: {e}");
+    }
 
     inflight.close();
     tokio::select! { _ = inflight.wait() => {}, _ = kill.cancelled() => {} }
     drop(tx);
     drop(conn_permit);
     if let Ok(mut slot) = channel_task.lock()
-        && let Some(task) = slot.take() {
-            task.abort();
-        }
+        && let Some(task) = slot.take()
+    {
+        task.abort();
+    }
     if kill.is_cancelled() {
         writer.abort();
         let _ = writer.await;

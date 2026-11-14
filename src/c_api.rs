@@ -1,18 +1,8 @@
-
 #![allow(non_camel_case_types)]
 
-use crate::config::config::{
-    BigBytesConfig,
-    Config,
-    FramerConfig,
-    TlsConfig,
-};
+use crate::config::config::{BigBytesConfig, Config, FramerConfig, TlsConfig};
 
-use crate::core::commands::{
-    Request,
-    Response,
-    ResponseOpcode,
-};
+use crate::core::commands::{Request, Response, ResponseOpcode};
 
 use crate::core::handle::ServerHandle;
 use crate::core::router::Router;
@@ -20,37 +10,23 @@ use crate::core::server::Server;
 
 use bytes::Bytes;
 
-use std::ffi::{
-    CStr,
-    c_char,
-    c_void,
-};
+use std::ffi::{CStr, c_char, c_void};
 
-use std::net::{
-    IpAddr,
-    SocketAddr,
-};
+use std::net::{IpAddr, SocketAddr};
 
 use std::ptr;
 use std::str::FromStr;
 
-use std::sync::{
-    Arc,
-    Mutex,
-};
+use std::sync::{Arc, Mutex};
 
 use std::sync::mpsc;
 
-use std::thread::{
-    self,
-    JoinHandle,
-};
+use std::thread::{self, JoinHandle};
 
 use std::time::Duration;
 
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
-
 
 // ============================================================
 // Status codes
@@ -63,7 +39,6 @@ pub const MMA_SERVER_ERROR: i32 = -3;
 pub const MMA_SERVER_ALREADY_STARTED: i32 = -4;
 pub const MMA_REQUEST_ALREADY_COMPLETED: i32 = -5;
 pub const MMA_REQUEST_CANCELLED: i32 = -6;
-
 
 // ============================================================
 // ABI structures
@@ -157,28 +132,13 @@ pub struct MMA_ServerHandle {
     inner: ServerHandle,
 }
 
-
 // ============================================================
 // Callback types
 // ============================================================
 
-pub type MMA_RouteCallback =
-    Option<
-        extern "C" fn(
-            *mut MMA_Request,
-            *mut c_void,
-        )
-    >;
+pub type MMA_RouteCallback = Option<extern "C" fn(*mut MMA_Request, *mut c_void)>;
 
-pub type MMA_ChannelCallback =
-    Option<
-        extern "C" fn(
-            *mut MMA_Request,
-            u32,
-            *mut c_void,
-        )
-    >;
-
+pub type MMA_ChannelCallback = Option<extern "C" fn(*mut MMA_Request, u32, *mut c_void)>;
 
 // ============================================================
 // Internal asynchronous request
@@ -205,7 +165,6 @@ struct RequestState {
     expects_response: bool,
 }
 
-
 /*
  * Drops cancellation token when the route future is cancelled.
  *
@@ -219,10 +178,7 @@ struct CancellationGuard {
 
 impl CancellationGuard {
     fn new(token: CancellationToken) -> Self {
-        Self {
-            token,
-            armed: true,
-        }
+        Self { token, armed: true }
     }
 
     fn disarm(&mut self) {
@@ -238,16 +194,13 @@ impl Drop for CancellationGuard {
     }
 }
 
-
 /*
  * The C pointer is the data pointer of Arc<AsyncRequestState>.
  *
  * C must only use pointers obtained from an active callback,
  * or pointers for which it owns a retained Arc reference.
  */
-unsafe fn request_state<'a>(
-    request: *const MMA_Request,
-) -> Option<&'a RequestState> {
+unsafe fn request_state<'a>(request: *const MMA_Request) -> Option<&'a RequestState> {
     if request.is_null() {
         return None;
     }
@@ -259,39 +212,26 @@ unsafe fn request_state<'a>(
     unsafe { state.as_ref() }
 }
 
-
 // ============================================================
 // Registered handlers
 // ============================================================
 
 struct RegisteredRoute {
     route: String,
-    callback: extern "C" fn(
-        *mut MMA_Request,
-        *mut c_void,
-    ),
+    callback: extern "C" fn(*mut MMA_Request, *mut c_void),
     user_data: usize,
 }
 
 struct RegisteredChannelHandler {
     route: String,
-    callback: extern "C" fn(
-        *mut MMA_Request,
-        u32,
-        *mut c_void,
-    ),
+    callback: extern "C" fn(*mut MMA_Request, u32, *mut c_void),
     user_data: usize,
 }
 
 struct RegisteredLifecycleHandler {
-    callback: extern "C" fn(
-        *mut MMA_Request,
-        u32,
-        *mut c_void,
-    ),
+    callback: extern "C" fn(*mut MMA_Request, u32, *mut c_void),
     user_data: usize,
 }
-
 
 // ============================================================
 // Server
@@ -306,11 +246,9 @@ pub struct MMA_Server {
 
     channel_handlers: Vec<RegisteredChannelHandler>,
 
-    on_channel_connect_handler:
-        Option<RegisteredLifecycleHandler>,
+    on_channel_connect_handler: Option<RegisteredLifecycleHandler>,
 
-    on_channel_disconnect_handler:
-        Option<RegisteredLifecycleHandler>,
+    on_channel_disconnect_handler: Option<RegisteredLifecycleHandler>,
 
     started: bool,
 
@@ -321,45 +259,29 @@ pub struct MMA_Server {
     handle: Option<ServerHandle>,
 }
 
-
 // ============================================================
 // Utility
 // ============================================================
 
-fn valid_slice<T>(
-    data: *const T,
-    len: usize,
-) -> bool {
-    len == 0
-        || (
-            !data.is_null()
-            && len <= isize::MAX as usize
-        )
+fn valid_slice<T>(data: *const T, len: usize) -> bool {
+    len == 0 || (!data.is_null() && len <= isize::MAX as usize)
 }
 
-unsafe fn raw_slice<'a, T>(
-    data: *const T,
-    len: usize,
-) -> &'a [T] {
+unsafe fn raw_slice<'a, T>(data: *const T, len: usize) -> &'a [T] {
     if len == 0 {
         &[]
     } else {
         // SAFETY:
         // C must provide a readable, aligned buffer.
-        unsafe {
-            std::slice::from_raw_parts(data, len)
-        }
+        unsafe { std::slice::from_raw_parts(data, len) }
     }
 }
-
 
 // ============================================================
 // Framer configuration conversion
 // ============================================================
 
-fn framer_config_from_c(
-    config: MMA_FramerConfig,
-) -> Option<FramerConfig> {
+fn framer_config_from_c(config: MMA_FramerConfig) -> Option<FramerConfig> {
     if config.options_key_first > 1 {
         return None;
     }
@@ -381,22 +303,16 @@ fn framer_config_from_c(
         header_length: config.header_length,
 
         big_bytes_config: BigBytesConfig {
-            options_len_order:
-                config.big_bytes_config.options_len_order,
+            options_len_order: config.big_bytes_config.options_len_order,
 
-            payload_len_order:
-                config.big_bytes_config.payload_len_order,
+            payload_len_order: config.big_bytes_config.payload_len_order,
 
-            req_id_order:
-                config.big_bytes_config.req_id_order,
+            req_id_order: config.big_bytes_config.req_id_order,
         },
     })
 }
 
-
-fn framer_config_to_c(
-    config: &FramerConfig,
-) -> MMA_FramerConfig {
+fn framer_config_to_c(config: &FramerConfig) -> MMA_FramerConfig {
     MMA_FramerConfig {
         max_message_length: config.max_message_length,
 
@@ -414,37 +330,27 @@ fn framer_config_to_c(
         header_length: config.header_length,
 
         big_bytes_config: MMA_BigBytesConfig {
-            options_len_order:
-                config.big_bytes_config.options_len_order,
+            options_len_order: config.big_bytes_config.options_len_order,
 
-            payload_len_order:
-                config.big_bytes_config.payload_len_order,
+            payload_len_order: config.big_bytes_config.payload_len_order,
 
-            req_id_order:
-                config.big_bytes_config.req_id_order,
+            req_id_order: config.big_bytes_config.req_id_order,
         },
     }
 }
-
 
 // ============================================================
 // Server configuration conversion
 // ============================================================
 
-fn config_from_c(
-    config: &MMA_ServerConfig,
-) -> Option<Config> {
+fn config_from_c(config: &MMA_ServerConfig) -> Option<Config> {
     if config.bind_ip.is_null() {
         return None;
     }
 
     // SAFETY:
     // bind_ip must be a valid NUL-terminated C string.
-    let ip_str = unsafe {
-        CStr::from_ptr(config.bind_ip)
-    }
-    .to_str()
-    .ok()?;
+    let ip_str = unsafe { CStr::from_ptr(config.bind_ip) }.to_str().ok()?;
 
     let ip_addr = IpAddr::from_str(ip_str).ok()?;
 
@@ -453,48 +359,33 @@ fn config_from_c(
     } else {
         // SAFETY:
         // C must provide a valid MMA_TLSConfig.
-        let tls = unsafe {
-            &*config.tls_config
-        };
+        let tls = unsafe { &*config.tls_config };
 
-        if tls.tls_certificate_path.is_null()
-            || tls.tls_key_path.is_null()
-        {
+        if tls.tls_certificate_path.is_null() || tls.tls_key_path.is_null() {
             return None;
         }
 
-        let cert = unsafe {
-            CStr::from_ptr(tls.tls_certificate_path)
-        }
-        .to_str()
-        .ok()?
-        .to_owned();
+        let cert = unsafe { CStr::from_ptr(tls.tls_certificate_path) }
+            .to_str()
+            .ok()?
+            .to_owned();
 
-        let key = unsafe {
-            CStr::from_ptr(tls.tls_key_path)
-        }
-        .to_str()
-        .ok()?
-        .to_owned();
+        let key = unsafe { CStr::from_ptr(tls.tls_key_path) }
+            .to_str()
+            .ok()?
+            .to_owned();
 
         Some(TlsConfig {
             tls_certificate_path: cert,
             tls_key_path: key,
-            tls_handshake_timeout:
-                Duration::from_millis(
-                    tls.tls_handshake_timeout
-                ),
+            tls_handshake_timeout: Duration::from_millis(tls.tls_handshake_timeout),
         })
     };
 
     Some(Config {
-        address: SocketAddr::new(
-            ip_addr,
-            config.port,
-        ),
+        address: SocketAddr::new(ip_addr, config.port),
 
-        frame_config:
-            framer_config_from_c(config.framer)?,
+        frame_config: framer_config_from_c(config.framer)?,
 
         max_batch: config.max_batch,
 
@@ -502,71 +393,56 @@ fn config_from_c(
 
         max_in_flight: config.max_in_flight,
 
-        drain_timeout:
-            Duration::from_millis(config.drain_timeout_ms),
+        drain_timeout: Duration::from_millis(config.drain_timeout_ms),
 
-        shutdown_grace:
-            Duration::from_millis(config.shutdown_grace_ms),
+        shutdown_grace: Duration::from_millis(config.shutdown_grace_ms),
 
-        request_timeout:
-            Duration::from_millis(config.request_timeout_ms),
+        request_timeout: Duration::from_millis(config.request_timeout_ms),
 
         tls_config,
     })
 }
-
 
 // ============================================================
 // Async request: route dispatch
 // ============================================================
 
 async fn invoke_route(
-    callback: extern "C" fn(
-        *mut MMA_Request,
-        *mut c_void,
-    ),
+    callback: extern "C" fn(*mut MMA_Request, *mut c_void),
     request: Request,
     user_data: usize,
 ) -> Response {
     let request_id = request.headers.req_id;
 
-    let (response_tx, response_rx) =
-        oneshot::channel::<Box<MMA_Response>>();
+    let (response_tx, response_rx) = oneshot::channel::<Box<MMA_Response>>();
 
     let cancellation = CancellationToken::new();
 
     let state = Arc::new(RequestState {
         request,
 
-        response_tx: Mutex::new(
-            Some(response_tx)
-        ),
+        response_tx: Mutex::new(Some(response_tx)),
 
         cancellation: cancellation.clone(),
 
         expects_response: true,
     });
 
-    let mut cancellation_guard =
-        CancellationGuard::new(cancellation);
+    let mut cancellation_guard = CancellationGuard::new(cancellation);
 
     /*
      * Borrowed reference held by this future.
      *
      * C may call retain() before this callback returns.
      */
-    let request_handle =
-        Arc::as_ptr(&state) as *mut MMA_Request;
+    let request_handle = Arc::as_ptr(&state) as *mut MMA_Request;
 
     /*
      * Important:
      * The callback must return quickly.
      * It must schedule I/O/CPU work elsewhere.
      */
-    callback(
-        request_handle,
-        user_data as *mut c_void,
-    );
+    callback(request_handle, user_data as *mut c_void);
 
     /*
      * Tokio waits asynchronously here.
@@ -579,23 +455,16 @@ async fn invoke_route(
             response.inner
         }
 
-        Err(_) => {
-            Response::internal_error(request_id)
-        }
+        Err(_) => Response::internal_error(request_id),
     }
 }
-
 
 // ============================================================
 // Async request: channel/lifecycle dispatch
 // ============================================================
 
 fn invoke_async_channel(
-    callback: extern "C" fn(
-        *mut MMA_Request,
-        u32,
-        *mut c_void,
-    ),
+    callback: extern "C" fn(*mut MMA_Request, u32, *mut c_void),
     request: Request,
     conn_id: u32,
     user_data: usize,
@@ -610,20 +479,14 @@ fn invoke_async_channel(
         expects_response: false,
     });
 
-    let request_handle =
-        Arc::as_ptr(&state) as *mut MMA_Request;
+    let request_handle = Arc::as_ptr(&state) as *mut MMA_Request;
 
     /*
      * The callback should enqueue work and return.
      * If it needs request data later, it must retain the handle.
      */
-    callback(
-        request_handle,
-        conn_id,
-        user_data as *mut c_void,
-    );
+    callback(request_handle, conn_id, user_data as *mut c_void);
 }
-
 
 // ============================================================
 // Router construction
@@ -634,11 +497,9 @@ fn router_from_registrations(
 
     channel_handlers: &[RegisteredChannelHandler],
 
-    on_channel_connect_handler:
-        Option<&RegisteredLifecycleHandler>,
+    on_channel_connect_handler: Option<&RegisteredLifecycleHandler>,
 
-    on_channel_disconnect_handler:
-        Option<&RegisteredLifecycleHandler>,
+    on_channel_disconnect_handler: Option<&RegisteredLifecycleHandler>,
 ) -> Result<Router, String> {
     let mut router = Router::new();
 
@@ -653,24 +514,11 @@ fn router_from_registrations(
         router
             .register_route(
                 route.route.clone(),
-
-                move |request: Request, _response: Response| {
-                    async move {
-                        invoke_route(
-                            callback,
-                            request,
-                            user_data,
-                        )
-                        .await
-                    }
+                move |request: Request, _response: Response| async move {
+                    invoke_route(callback, request, user_data).await
                 },
             )
-            .map_err(|error| {
-                format!(
-                    "route {:?}: {error}",
-                    route.route
-                )
-            })?;
+            .map_err(|error| format!("route {:?}: {error}", route.route))?;
     }
 
     // --------------------------------------------------------
@@ -684,24 +532,11 @@ fn router_from_registrations(
         router
             .register_channel_handler(
                 handler.route.clone(),
-
-                move |request: Request, conn_id: u32| {
-                    async move {
-                        invoke_async_channel(
-                            callback,
-                            request,
-                            conn_id,
-                            user_data,
-                        );
-                    }
+                move |request: Request, conn_id: u32| async move {
+                    invoke_async_channel(callback, request, conn_id, user_data);
                 },
             )
-            .map_err(|error| {
-                format!(
-                    "channel route {:?}: {error}",
-                    handler.route
-                )
-            })?;
+            .map_err(|error| format!("channel route {:?}: {error}", handler.route))?;
     }
 
     // --------------------------------------------------------
@@ -713,15 +548,8 @@ fn router_from_registrations(
         let user_data = handler.user_data;
 
         router.register_on_channel_connect_handler(
-            move |request: Request, conn_id: u32| {
-                async move {
-                    invoke_async_channel(
-                        callback,
-                        request,
-                        conn_id,
-                        user_data,
-                    );
-                }
+            move |request: Request, conn_id: u32| async move {
+                invoke_async_channel(callback, request, conn_id, user_data);
             },
         );
     }
@@ -735,15 +563,8 @@ fn router_from_registrations(
         let user_data = handler.user_data;
 
         router.register_on_channel_disconnect_handler(
-            move |request: Request, conn_id: u32| {
-                async move {
-                    invoke_async_channel(
-                        callback,
-                        request,
-                        conn_id,
-                        user_data,
-                    );
-                }
+            move |request: Request, conn_id: u32| async move {
+                invoke_async_channel(callback, request, conn_id, user_data);
             },
         );
     }
@@ -751,15 +572,12 @@ fn router_from_registrations(
     Ok(router)
 }
 
-
 // ============================================================
 // Server configuration defaults
 // ============================================================
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mma_server_config_default(
-    output: *mut MMA_ServerConfig,
-) -> i32 {
+pub unsafe extern "C" fn mma_server_config_default(output: *mut MMA_ServerConfig) -> i32 {
     if output.is_null() {
         return MMA_INVALID_ARGUMENT;
     }
@@ -793,7 +611,6 @@ pub unsafe extern "C" fn mma_server_config_default(
     MMA_OK
 }
 
-
 // ============================================================
 // Server creation
 // ============================================================
@@ -816,18 +633,13 @@ pub unsafe extern "C" fn mma_server_create(
     }
 
     // SAFETY: caller provides an initialized config.
-    let config = unsafe {
-        *config
-    };
+    let config = unsafe { *config };
 
-    let Some(rust_config) = config_from_c(&config)
-    else {
+    let Some(rust_config) = config_from_c(&config) else {
         return MMA_INVALID_CONFIG;
     };
 
-    if rust_config.frame_config.validate().is_err()
-        || rust_config.validate().is_err()
-    {
+    if rust_config.frame_config.validate().is_err() || rust_config.validate().is_err() {
         return MMA_INVALID_CONFIG;
     }
 
@@ -856,14 +668,11 @@ pub unsafe extern "C" fn mma_server_create(
     };
 
     unsafe {
-        *output = Box::into_raw(
-            Box::new(server)
-        );
+        *output = Box::into_raw(Box::new(server));
     }
 
     MMA_OK
 }
-
 
 // ============================================================
 // Route registration
@@ -881,31 +690,21 @@ pub unsafe extern "C" fn mma_server_register_route(
 
     user_data: *mut c_void,
 ) -> i32 {
-    if server.is_null()
-        || !valid_slice(route, route_len)
-    {
+    if server.is_null() || !valid_slice(route, route_len) {
         return MMA_INVALID_ARGUMENT;
     }
 
-    let server = unsafe {
-        &mut *server
-    };
+    let server = unsafe { &mut *server };
 
     if server.started {
         return MMA_SERVER_ALREADY_STARTED;
     }
 
-    if route_len == 0
-        || route_len > u8::MAX as usize
-    {
+    if route_len == 0 || route_len > u8::MAX as usize {
         return MMA_INVALID_ARGUMENT;
     }
 
-    let route = match std::str::from_utf8(
-        unsafe {
-            raw_slice(route, route_len)
-        }
-    ) {
+    let route = match std::str::from_utf8(unsafe { raw_slice(route, route_len) }) {
         Ok(value) => value,
 
         Err(_) => {
@@ -917,19 +716,16 @@ pub unsafe extern "C" fn mma_server_register_route(
         return MMA_INVALID_ARGUMENT;
     };
 
-    server.routes.push(
-        RegisteredRoute {
-            route: route.to_owned(),
+    server.routes.push(RegisteredRoute {
+        route: route.to_owned(),
 
-            callback,
+        callback,
 
-            user_data: user_data as usize,
-        }
-    );
+        user_data: user_data as usize,
+    });
 
     MMA_OK
 }
-
 
 // ============================================================
 // Channel handler registration
@@ -947,31 +743,21 @@ pub unsafe extern "C" fn mma_server_register_channel_handler(
 
     user_data: *mut c_void,
 ) -> i32 {
-    if server.is_null()
-        || !valid_slice(route, route_len)
-    {
+    if server.is_null() || !valid_slice(route, route_len) {
         return MMA_INVALID_ARGUMENT;
     }
 
-    let server = unsafe {
-        &mut *server
-    };
+    let server = unsafe { &mut *server };
 
     if server.started {
         return MMA_SERVER_ALREADY_STARTED;
     }
 
-    if route_len == 0
-        || route_len > u8::MAX as usize
-    {
+    if route_len == 0 || route_len > u8::MAX as usize {
         return MMA_INVALID_ARGUMENT;
     }
 
-    let route = match std::str::from_utf8(
-        unsafe {
-            raw_slice(route, route_len)
-        }
-    ) {
+    let route = match std::str::from_utf8(unsafe { raw_slice(route, route_len) }) {
         Ok(value) => value,
 
         Err(_) => {
@@ -983,19 +769,16 @@ pub unsafe extern "C" fn mma_server_register_channel_handler(
         return MMA_INVALID_ARGUMENT;
     };
 
-    server.channel_handlers.push(
-        RegisteredChannelHandler {
-            route: route.to_owned(),
+    server.channel_handlers.push(RegisteredChannelHandler {
+        route: route.to_owned(),
 
-            callback,
+        callback,
 
-            user_data: user_data as usize,
-        }
-    );
+        user_data: user_data as usize,
+    });
 
     MMA_OK
 }
-
 
 // ============================================================
 // Lifecycle registration
@@ -1013,9 +796,7 @@ pub unsafe extern "C" fn mma_server_register_on_channel_connect_handler(
         return MMA_INVALID_ARGUMENT;
     }
 
-    let server = unsafe {
-        &mut *server
-    };
+    let server = unsafe { &mut *server };
 
     if server.started {
         return MMA_SERVER_ALREADY_STARTED;
@@ -1025,15 +806,13 @@ pub unsafe extern "C" fn mma_server_register_on_channel_connect_handler(
         return MMA_INVALID_ARGUMENT;
     };
 
-    server.on_channel_connect_handler =
-        Some(RegisteredLifecycleHandler {
-            callback,
-            user_data: user_data as usize,
-        });
+    server.on_channel_connect_handler = Some(RegisteredLifecycleHandler {
+        callback,
+        user_data: user_data as usize,
+    });
 
     MMA_OK
 }
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mma_server_register_on_channel_disconnect_handler(
@@ -1047,9 +826,7 @@ pub unsafe extern "C" fn mma_server_register_on_channel_disconnect_handler(
         return MMA_INVALID_ARGUMENT;
     }
 
-    let server = unsafe {
-        &mut *server
-    };
+    let server = unsafe { &mut *server };
 
     if server.started {
         return MMA_SERVER_ALREADY_STARTED;
@@ -1059,31 +836,25 @@ pub unsafe extern "C" fn mma_server_register_on_channel_disconnect_handler(
         return MMA_INVALID_ARGUMENT;
     };
 
-    server.on_channel_disconnect_handler =
-        Some(RegisteredLifecycleHandler {
-            callback,
-            user_data: user_data as usize,
-        });
+    server.on_channel_disconnect_handler = Some(RegisteredLifecycleHandler {
+        callback,
+        user_data: user_data as usize,
+    });
 
     MMA_OK
 }
-
 
 // ============================================================
 // Server start
 // ============================================================
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mma_server_start(
-    server: *mut MMA_Server,
-) -> i32 {
+pub unsafe extern "C" fn mma_server_start(server: *mut MMA_Server) -> i32 {
     if server.is_null() {
         return MMA_INVALID_ARGUMENT;
     }
 
-    let server = unsafe {
-        &mut *server
-    };
+    let server = unsafe { &mut *server };
 
     if server.started {
         return MMA_SERVER_ALREADY_STARTED;
@@ -1100,9 +871,7 @@ pub unsafe extern "C" fn mma_server_start(
         Ok(router) => router,
 
         Err(error) => {
-            eprintln!(
-                "MMA router initialization failed: {error}"
-            );
+            eprintln!("MMA router initialization failed: {error}");
 
             return MMA_SERVER_ERROR;
         }
@@ -1110,10 +879,7 @@ pub unsafe extern "C" fn mma_server_start(
 
     let stop = server.stop.clone();
 
-    let (ready_tx, ready_rx) =
-        mpsc::sync_channel::<
-            Result<(SocketAddr, ServerHandle), String>
-        >(1);
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(SocketAddr, ServerHandle), String>>(1);
 
     /*
      * One dedicated OS thread owns the Tokio runtime.
@@ -1130,93 +896,61 @@ pub unsafe extern "C" fn mma_server_start(
                 Ok(runtime) => runtime,
 
                 Err(error) => {
-                    let _ = ready_tx.send(
-                        Err(format!(
-                            "Tokio runtime initialization failed: {error}"
-                        ))
-                    );
+                    let _ =
+                        ready_tx.send(Err(format!("Tokio runtime initialization failed: {error}")));
 
                     return;
                 }
             };
 
             runtime.block_on(async move {
-                let listener =
-                    match tokio::net::TcpListener::bind(
-                        config.address
-                    )
-                    .await
-                    {
-                        Ok(listener) => listener,
-
-                        Err(error) => {
-                            let _ = ready_tx.send(
-                                Err(format!(
-                                    "TCP bind failed: {error}"
-                                ))
-                            );
-
-                            return;
-                        }
-                    };
-
-                let local_addr = match listener.local_addr() {
-                    Ok(addr) => addr,
+                let listener = match tokio::net::TcpListener::bind(config.address).await {
+                    Ok(listener) => listener,
 
                     Err(error) => {
-                        let _ = ready_tx.send(
-                            Err(format!(
-                                "Cannot obtain listener address: {error}"
-                            ))
-                        );
+                        let _ = ready_tx.send(Err(format!("TCP bind failed: {error}")));
 
                         return;
                     }
                 };
 
-                let mut running_server =
-                    match Server::from_listener(
-                        config,
-                        listener,
-                    ) {
-                        Ok(server) => server,
+                let local_addr = match listener.local_addr() {
+                    Ok(addr) => addr,
 
-                        Err(error) => {
-                            let _ = ready_tx.send(
-                                Err(format!(
-                                    "Server initialization failed: {error}"
-                                ))
-                            );
+                    Err(error) => {
+                        let _ =
+                            ready_tx.send(Err(format!("Cannot obtain listener address: {error}")));
 
-                            return;
-                        }
-                    };
+                        return;
+                    }
+                };
+
+                let mut running_server = match Server::from_listener(config, listener) {
+                    Ok(server) => server,
+
+                    Err(error) => {
+                        let _ =
+                            ready_tx.send(Err(format!("Server initialization failed: {error}")));
+
+                        return;
+                    }
+                };
 
                 let handle = running_server.handle();
 
-                if ready_tx.send(
-                    Ok((local_addr, handle))
-                ).is_err() {
+                if ready_tx.send(Ok((local_addr, handle))).is_err() {
                     return;
                 }
 
-                if let Err(error) = running_server
-                    .run_until(router, stop.cancelled())
-                    .await
-                {
-                    eprintln!(
-                        "MMA server stopped after an error: {error}"
-                    );
+                if let Err(error) = running_server.run_until(router, stop.cancelled()).await {
+                    eprintln!("MMA server stopped after an error: {error}");
                 }
             });
-        })
-    {
+        }) {
         Ok(thread) => thread,
 
         Err(error) => {
-            eprintln!(
-                "Failed to create MMA runtime thread: {error}"
-            );
+            eprintln!("Failed to create MMA runtime thread: {error}");
 
             return MMA_SERVER_ERROR;
         }
@@ -1235,9 +969,7 @@ pub unsafe extern "C" fn mma_server_start(
         }
 
         Ok(Err(error)) => {
-            eprintln!(
-                "MMA server startup failed: {error}"
-            );
+            eprintln!("MMA server startup failed: {error}");
 
             let _ = thread.join();
 
@@ -1245,9 +977,7 @@ pub unsafe extern "C" fn mma_server_start(
         }
 
         Err(error) => {
-            eprintln!(
-                "MMA startup handshake failed: {error}"
-            );
+            eprintln!("MMA startup handshake failed: {error}");
 
             let _ = thread.join();
 
@@ -1256,15 +986,12 @@ pub unsafe extern "C" fn mma_server_start(
     }
 }
 
-
 // ============================================================
 // Async request refcount
 // ============================================================
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mma_request_retain(
-    request: *mut MMA_Request,
-) -> i32 {
+pub unsafe extern "C" fn mma_request_retain(request: *mut MMA_Request) -> i32 {
     if request.is_null() {
         return MMA_INVALID_ARGUMENT;
     }
@@ -1274,31 +1001,23 @@ pub unsafe extern "C" fn mma_request_retain(
      * so increment_strong_count is valid during the callback.
      */
     unsafe {
-        Arc::increment_strong_count(
-            request.cast::<RequestState>()
-        );
+        Arc::increment_strong_count(request.cast::<RequestState>());
     }
 
     MMA_OK
 }
 
-
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mma_request_release(
-    request: *mut MMA_Request,
-) {
+pub unsafe extern "C" fn mma_request_release(request: *mut MMA_Request) {
     if !request.is_null() {
         /*
          * Must be called exactly once for every successful retain().
          */
         unsafe {
-            Arc::decrement_strong_count(
-                request.cast::<RequestState>()
-            );
+            Arc::decrement_strong_count(request.cast::<RequestState>());
         }
     }
 }
-
 
 // ============================================================
 // Async request information
@@ -1314,11 +1033,7 @@ pub unsafe extern "C" fn mma_request_get_info(
         return MMA_INVALID_ARGUMENT;
     }
 
-    let Some(state) = (
-        unsafe {
-            request_state(request)
-        }
-    ) else {
+    let Some(state) = (unsafe { request_state(request) }) else {
         return MMA_INVALID_ARGUMENT;
     };
 
@@ -1344,7 +1059,6 @@ pub unsafe extern "C" fn mma_request_get_info(
     MMA_OK
 }
 
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mma_request_option_count(
     request: *const MMA_Request,
@@ -1355,11 +1069,7 @@ pub unsafe extern "C" fn mma_request_option_count(
         return MMA_INVALID_ARGUMENT;
     }
 
-    let Some(state) = (
-        unsafe {
-            request_state(request)
-        }
-    ) else {
+    let Some(state) = (unsafe { request_state(request) }) else {
         return MMA_INVALID_ARGUMENT;
     };
 
@@ -1369,7 +1079,6 @@ pub unsafe extern "C" fn mma_request_option_count(
 
     MMA_OK
 }
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mma_request_option_at(
@@ -1392,17 +1101,11 @@ pub unsafe extern "C" fn mma_request_option_at(
         return MMA_INVALID_ARGUMENT;
     }
 
-    let Some(state) = (
-        unsafe {
-            request_state(request)
-        }
-    ) else {
+    let Some(state) = (unsafe { request_state(request) }) else {
         return MMA_INVALID_ARGUMENT;
     };
 
-    let Some((option_key, option_value)) =
-        state.request.options.get(index)
-    else {
+    let Some((option_key, option_value)) = state.request.options.get(index) else {
         return MMA_INVALID_ARGUMENT;
     };
 
@@ -1416,7 +1119,6 @@ pub unsafe extern "C" fn mma_request_option_at(
 
     MMA_OK
 }
-
 
 // ============================================================
 // Request cancellation
@@ -1432,23 +1134,16 @@ pub unsafe extern "C" fn mma_request_is_cancelled(
         return MMA_INVALID_ARGUMENT;
     }
 
-    let Some(state) = (
-        unsafe {
-            request_state(request)
-        }
-    ) else {
+    let Some(state) = (unsafe { request_state(request) }) else {
         return MMA_INVALID_ARGUMENT;
     };
 
     unsafe {
-        *output = u8::from(
-            state.cancellation.is_cancelled()
-        );
+        *output = u8::from(state.cancellation.is_cancelled());
     }
 
     MMA_OK
 }
-
 
 // ============================================================
 // Request completion
@@ -1464,11 +1159,7 @@ pub unsafe extern "C" fn mma_request_complete(
         return MMA_INVALID_ARGUMENT;
     }
 
-    let Some(state) = (
-        unsafe {
-            request_state(request)
-        }
-    ) else {
+    let Some(state) = (unsafe { request_state(request) }) else {
         return MMA_INVALID_ARGUMENT;
     };
 
@@ -1505,9 +1196,7 @@ pub unsafe extern "C" fn mma_request_complete(
     /*
      * Consume the C response handle.
      */
-    let response = unsafe {
-        Box::from_raw(response)
-    };
+    let response = unsafe { Box::from_raw(response) };
 
     match sender.send(response) {
         Ok(()) => MMA_OK,
@@ -1522,49 +1211,35 @@ pub unsafe extern "C" fn mma_request_complete(
     }
 }
 
-
 // ============================================================
 // Response construction
 // ============================================================
 
 #[unsafe(no_mangle)]
-pub extern "C" fn mma_response_new(
-    request_id: u32,
-) -> *mut MMA_Response {
+pub extern "C" fn mma_response_new(request_id: u32) -> *mut MMA_Response {
     let response = MMA_Response {
         inner: Response::new(request_id),
     };
 
-    Box::into_raw(
-        Box::new(response)
-    )
+    Box::into_raw(Box::new(response))
 }
 
-
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mma_response_set_status(
-    response: *mut MMA_Response,
-
-    opcode: u8,
-) -> i32 {
+pub unsafe extern "C" fn mma_response_set_status(response: *mut MMA_Response, opcode: u8) -> i32 {
     if response.is_null() {
         return MMA_INVALID_ARGUMENT;
     }
 
-    let Some(opcode) = ResponseOpcode::from_number(opcode)
-    else {
+    let Some(opcode) = ResponseOpcode::from_number(opcode) else {
         return MMA_INVALID_ARGUMENT;
     };
 
-    let response = unsafe {
-        &mut *response
-    };
+    let response = unsafe { &mut *response };
 
     response.inner.headers.opcode = opcode;
 
     MMA_OK
 }
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mma_response_set_payload(
@@ -1573,19 +1248,13 @@ pub unsafe extern "C" fn mma_response_set_payload(
     data: *const u8,
     data_len: usize,
 ) -> i32 {
-    if response.is_null()
-        || !valid_slice(data, data_len)
-    {
+    if response.is_null() || !valid_slice(data, data_len) {
         return MMA_INVALID_ARGUMENT;
     }
 
-    let payload = unsafe {
-        raw_slice(data, data_len)
-    };
+    let payload = unsafe { raw_slice(data, data_len) };
 
-    let response = unsafe {
-        &mut *response
-    };
+    let response = unsafe { &mut *response };
 
     /*
      * This API copies C memory into Bytes.
@@ -1593,12 +1262,10 @@ pub unsafe extern "C" fn mma_response_set_payload(
      * A separate ownership-transfer buffer API can be added
      * later without changing the async completion mechanism.
      */
-    response.inner.payload =
-        Bytes::copy_from_slice(payload);
+    response.inner.payload = Bytes::copy_from_slice(payload);
 
     MMA_OK
 }
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mma_response_add_option(
@@ -1621,42 +1288,32 @@ pub unsafe extern "C" fn mma_response_add_option(
         return MMA_INVALID_ARGUMENT;
     }
 
-    let response = unsafe {
-        &mut *response
-    };
+    let response = unsafe { &mut *response };
 
     if response.inner.options.len() >= u8::MAX as usize {
         return MMA_INVALID_ARGUMENT;
     }
 
-    let key = unsafe {
-        raw_slice(key, key_len)
-    };
+    let key = unsafe { raw_slice(key, key_len) };
 
-    let value = unsafe {
-        raw_slice(value, value_len)
-    };
+    let value = unsafe { raw_slice(value, value_len) };
 
-    response.inner.options.push((
-        Bytes::copy_from_slice(key),
-        Bytes::copy_from_slice(value),
-    ));
+    response
+        .inner
+        .options
+        .push((Bytes::copy_from_slice(key), Bytes::copy_from_slice(value)));
 
     MMA_OK
 }
 
-
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mma_response_destroy(
-    response: *mut MMA_Response,
-) {
+pub unsafe extern "C" fn mma_response_destroy(response: *mut MMA_Response) {
     if !response.is_null() {
         unsafe {
             drop(Box::from_raw(response));
         }
     }
 }
-
 
 // ============================================================
 // Server handle
@@ -1676,9 +1333,7 @@ pub unsafe extern "C" fn mma_server_get_handle(
         *output = ptr::null_mut();
     }
 
-    let server = unsafe {
-        &*server
-    };
+    let server = unsafe { &*server };
 
     if !server.started {
         return MMA_SERVER_ERROR;
@@ -1696,11 +1351,9 @@ pub unsafe extern "C" fn mma_server_get_handle(
         return MMA_SERVER_ERROR;
     };
 
-    let handle = Box::new(
-        MMA_ServerHandle {
-            inner: handle.clone(),
-        }
-    );
+    let handle = Box::new(MMA_ServerHandle {
+        inner: handle.clone(),
+    });
 
     unsafe {
         *output = Box::into_raw(handle);
@@ -1709,18 +1362,14 @@ pub unsafe extern "C" fn mma_server_get_handle(
     MMA_OK
 }
 
-
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mma_server_handle_destroy(
-    handle: *mut MMA_ServerHandle,
-) {
+pub unsafe extern "C" fn mma_server_handle_destroy(handle: *mut MMA_ServerHandle) {
     if !handle.is_null() {
         unsafe {
             drop(Box::from_raw(handle));
         }
     }
 }
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mma_server_handle_send_to_channel(
@@ -1734,13 +1383,9 @@ pub unsafe extern "C" fn mma_server_handle_send_to_channel(
         return MMA_INVALID_ARGUMENT;
     }
 
-    let handle = unsafe {
-        &*handle
-    };
+    let handle = unsafe { &*handle };
 
-    let message = unsafe {
-        &*message
-    };
+    let message = unsafe { &*message };
 
     /*
      * Bytes are reference-counted.
@@ -1748,16 +1393,12 @@ pub unsafe extern "C" fn mma_server_handle_send_to_channel(
      */
     let message = message.inner.clone();
 
-    match handle.inner.try_send_to_channel(
-        conn_id,
-        message,
-    ) {
+    match handle.inner.try_send_to_channel(conn_id, message) {
         Ok(()) => MMA_OK,
 
         Err(_) => MMA_SERVER_ERROR,
     }
 }
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mma_server_handle_change_config(
@@ -1769,21 +1410,15 @@ pub unsafe extern "C" fn mma_server_handle_change_config(
         return MMA_INVALID_ARGUMENT;
     }
 
-    let handle = unsafe {
-        &*handle
-    };
+    let handle = unsafe { &*handle };
 
-    let config = unsafe {
-        &*config
-    };
+    let config = unsafe { &*config };
 
     let Some(config) = config_from_c(config) else {
         return MMA_INVALID_CONFIG;
     };
 
-    if config.frame_config.validate().is_err()
-        || config.validate().is_err()
-    {
+    if config.frame_config.validate().is_err() || config.validate().is_err() {
         return MMA_INVALID_CONFIG;
     }
 
@@ -1791,26 +1426,19 @@ pub unsafe extern "C" fn mma_server_handle_change_config(
         Ok(()) => MMA_OK,
 
         Err(error) => {
-            eprintln!(
-                "MMA config update failed: {error}"
-            );
+            eprintln!("MMA config update failed: {error}");
 
             MMA_SERVER_ERROR
         }
     }
 }
 
-
 // ============================================================
 // Local server port
 // ============================================================
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mma_server_local_port(
-    server: *const MMA_Server,
-
-    port: *mut u16,
-) -> i32 {
+pub unsafe extern "C" fn mma_server_local_port(server: *const MMA_Server, port: *mut u16) -> i32 {
     if server.is_null() || port.is_null() {
         return MMA_INVALID_ARGUMENT;
     }
@@ -1822,22 +1450,17 @@ pub unsafe extern "C" fn mma_server_local_port(
     MMA_OK
 }
 
-
 // ============================================================
 // Stop / destroy
 // ============================================================
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mma_server_stop(
-    server: *mut MMA_Server,
-) -> i32 {
+pub unsafe extern "C" fn mma_server_stop(server: *mut MMA_Server) -> i32 {
     if server.is_null() {
         return MMA_INVALID_ARGUMENT;
     }
 
-    let server = unsafe {
-        &mut *server
-    };
+    let server = unsafe { &mut *server };
 
     server.stop.cancel();
 
@@ -1854,15 +1477,10 @@ pub unsafe extern "C" fn mma_server_stop(
     MMA_OK
 }
 
-
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mma_server_destroy(
-    server: *mut MMA_Server,
-) {
+pub unsafe extern "C" fn mma_server_destroy(server: *mut MMA_Server) {
     if !server.is_null() {
-        let _ = unsafe {
-            mma_server_stop(server)
-        };
+        let _ = unsafe { mma_server_stop(server) };
 
         unsafe {
             drop(Box::from_raw(server));
