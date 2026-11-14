@@ -54,7 +54,7 @@ jobs:
           cache-dependency-path: go.sum
 
       - name: Test Go bindings against the freshly built native library
-        run: go test -tags native_integration ./cabi
+        run: go test -tags native_integration ./go
         env:
           MMA_NATIVE_DIR: target/release
 
@@ -201,7 +201,7 @@ jobs:
         run: go test ./...
 
       - name: Run Go native integration tests on Windows
-        run: go test -tags native_integration ./cabi
+        run: go test -tags native_integration ./go
         env:
           MMA_NATIVE_DIR: target/release
 
@@ -234,7 +234,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          unformatted="$(gofmt -l cabi)"
+          unformatted="$(gofmt -l go)"
           if [[ -n "$unformatted" ]]; then
             echo "Go files require gofmt:" >&2
             echo "$unformatted" >&2
