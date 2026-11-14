@@ -144,9 +144,20 @@ func nativeSizeToInt(size uintptr) (int, error) {
 	return int(size), nil
 }
 
-// nativeRouteCallback is a C-ABI callback. It only retains the native request
-// and schedules Go work; user code never runs on a Tokio worker thread.
-func nativeRouteCallback(_ purego.CDecl, request unsafe.Pointer, userData uintptr) {
+// nativeRouteCallback is the purego callback trampoline.
+//
+// purego's Windows callback implementation requires exactly one uintptr-sized
+// result. The Rust C ABI declares MMA_RouteCallback as returning void, so Rust
+// ignores this zero return value. Keep the ABI adapter separate from the Go
+// callback implementation so the native-facing signature stays minimal.
+func nativeRouteCallback(_ purego.CDecl, request unsafe.Pointer, userData uintptr) uintptr {
+	nativeRouteCallbackImpl(request, userData)
+	return 0
+}
+
+// nativeRouteCallbackImpl performs the route callback work. It is deliberately
+// a normal Go function (no ABI-specific return value).
+func nativeRouteCallbackImpl(request unsafe.Pointer, userData uintptr) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			log.Printf("MMA Go route callback panic: %v", recovered)
@@ -258,13 +269,28 @@ func isNativeRequestCancelled(api *nativeAPI, request unsafe.Pointer) bool {
 	return cancelled != 0
 }
 
-// nativeChannelCallback is shared by channel-message and lifecycle callbacks.
-// The request is copied and the handler is invoked inline so messages from a
-// single TCP connection retain their delivery order. Channel handlers should
-// therefore be short and non-blocking; they can enqueue the copied Request to
-// an application-owned worker and return if more work is required.
+// nativeChannelCallback is the purego callback trampoline.
+//
+// purego's Windows callback implementation requires exactly one uintptr-sized
+// result. The Rust C ABI declares MMA_ChannelCallback as returning void, so
+// Rust ignores this zero return value.
 func nativeChannelCallback(
 	_ purego.CDecl,
+	request unsafe.Pointer,
+	connectionID uint32,
+	userData uintptr,
+) uintptr {
+	nativeChannelCallbackImpl(request, connectionID, userData)
+	return 0
+}
+
+// nativeChannelCallbackImpl is shared by channel-message and lifecycle
+// callbacks. The request is copied and the handler is invoked inline so
+// messages from a single TCP connection retain their delivery order. Channel
+// handlers should therefore be short and non-blocking; they can enqueue the
+// copied Request to an application-owned worker and return if more work is
+// required.
+func nativeChannelCallbackImpl(
 	request unsafe.Pointer,
 	connectionID uint32,
 	userData uintptr,
