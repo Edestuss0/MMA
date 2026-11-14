@@ -126,7 +126,7 @@ pub struct MMA_ServerConfig {
 }
 
 #[repr(C)]
-pub struct MMA_AsyncRequest {
+pub struct MMA_Request {
     _private: [u8; 0],
 }
 
@@ -162,18 +162,18 @@ pub struct MMA_ServerHandle {
 // Callback types
 // ============================================================
 
-pub type MMA_AsyncRouteCallback =
+pub type MMA_RouteCallback =
     Option<
         extern "C" fn(
-            *mut MMA_AsyncRequest,
+            *mut MMA_Request,
             *mut c_void,
         )
     >;
 
-pub type MMA_AsyncChannelCallback =
+pub type MMA_ChannelCallback =
     Option<
         extern "C" fn(
-            *mut MMA_AsyncRequest,
+            *mut MMA_Request,
             u32,
             *mut c_void,
         )
@@ -184,7 +184,7 @@ pub type MMA_AsyncChannelCallback =
 // Internal asynchronous request
 // ============================================================
 
-struct AsyncRequestState {
+struct RequestState {
     /*
      * Request owns all backing buffers.
      *
@@ -246,13 +246,13 @@ impl Drop for CancellationGuard {
  * or pointers for which it owns a retained Arc reference.
  */
 unsafe fn request_state<'a>(
-    request: *const MMA_AsyncRequest,
-) -> Option<&'a AsyncRequestState> {
+    request: *const MMA_Request,
+) -> Option<&'a RequestState> {
     if request.is_null() {
         return None;
     }
 
-    let state = request.cast::<AsyncRequestState>();
+    let state = request.cast::<RequestState>();
 
     // SAFETY:
     // The caller must pass a live MMA_AsyncRequest handle.
@@ -267,7 +267,7 @@ unsafe fn request_state<'a>(
 struct RegisteredRoute {
     route: String,
     callback: extern "C" fn(
-        *mut MMA_AsyncRequest,
+        *mut MMA_Request,
         *mut c_void,
     ),
     user_data: usize,
@@ -276,7 +276,7 @@ struct RegisteredRoute {
 struct RegisteredChannelHandler {
     route: String,
     callback: extern "C" fn(
-        *mut MMA_AsyncRequest,
+        *mut MMA_Request,
         u32,
         *mut c_void,
     ),
@@ -285,7 +285,7 @@ struct RegisteredChannelHandler {
 
 struct RegisteredLifecycleHandler {
     callback: extern "C" fn(
-        *mut MMA_AsyncRequest,
+        *mut MMA_Request,
         u32,
         *mut c_void,
     ),
@@ -520,9 +520,9 @@ fn config_from_c(
 // Async request: route dispatch
 // ============================================================
 
-async fn invoke_async_route(
+async fn invoke_route(
     callback: extern "C" fn(
-        *mut MMA_AsyncRequest,
+        *mut MMA_Request,
         *mut c_void,
     ),
     request: Request,
@@ -535,7 +535,7 @@ async fn invoke_async_route(
 
     let cancellation = CancellationToken::new();
 
-    let state = Arc::new(AsyncRequestState {
+    let state = Arc::new(RequestState {
         request,
 
         response_tx: Mutex::new(
@@ -556,7 +556,7 @@ async fn invoke_async_route(
      * C may call retain() before this callback returns.
      */
     let request_handle =
-        Arc::as_ptr(&state) as *mut MMA_AsyncRequest;
+        Arc::as_ptr(&state) as *mut MMA_Request;
 
     /*
      * Important:
@@ -592,7 +592,7 @@ async fn invoke_async_route(
 
 fn invoke_async_channel(
     callback: extern "C" fn(
-        *mut MMA_AsyncRequest,
+        *mut MMA_Request,
         u32,
         *mut c_void,
     ),
@@ -600,7 +600,7 @@ fn invoke_async_channel(
     conn_id: u32,
     user_data: usize,
 ) {
-    let state = Arc::new(AsyncRequestState {
+    let state = Arc::new(RequestState {
         request,
 
         response_tx: Mutex::new(None),
@@ -611,7 +611,7 @@ fn invoke_async_channel(
     });
 
     let request_handle =
-        Arc::as_ptr(&state) as *mut MMA_AsyncRequest;
+        Arc::as_ptr(&state) as *mut MMA_Request;
 
     /*
      * The callback should enqueue work and return.
@@ -656,7 +656,7 @@ fn router_from_registrations(
 
                 move |request: Request, _response: Response| {
                     async move {
-                        invoke_async_route(
+                        invoke_route(
                             callback,
                             request,
                             user_data,
@@ -870,14 +870,14 @@ pub unsafe extern "C" fn mma_server_create(
 // ============================================================
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mma_server_register_async_route(
+pub unsafe extern "C" fn mma_server_register_route(
     server: *mut MMA_Server,
 
     route: *const u8,
 
     route_len: usize,
 
-    callback: MMA_AsyncRouteCallback,
+    callback: MMA_RouteCallback,
 
     user_data: *mut c_void,
 ) -> i32 {
@@ -936,14 +936,14 @@ pub unsafe extern "C" fn mma_server_register_async_route(
 // ============================================================
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mma_server_register_async_channel_handler(
+pub unsafe extern "C" fn mma_server_register_channel_handler(
     server: *mut MMA_Server,
 
     route: *const u8,
 
     route_len: usize,
 
-    callback: MMA_AsyncChannelCallback,
+    callback: MMA_ChannelCallback,
 
     user_data: *mut c_void,
 ) -> i32 {
@@ -1002,10 +1002,10 @@ pub unsafe extern "C" fn mma_server_register_async_channel_handler(
 // ============================================================
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mma_server_register_async_on_channel_connect_handler(
+pub unsafe extern "C" fn mma_server_register_on_channel_connect_handler(
     server: *mut MMA_Server,
 
-    callback: MMA_AsyncChannelCallback,
+    callback: MMA_ChannelCallback,
 
     user_data: *mut c_void,
 ) -> i32 {
@@ -1036,10 +1036,10 @@ pub unsafe extern "C" fn mma_server_register_async_on_channel_connect_handler(
 
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mma_server_register_async_on_channel_disconnect_handler(
+pub unsafe extern "C" fn mma_server_register_on_channel_disconnect_handler(
     server: *mut MMA_Server,
 
-    callback: MMA_AsyncChannelCallback,
+    callback: MMA_ChannelCallback,
 
     user_data: *mut c_void,
 ) -> i32 {
@@ -1262,8 +1262,8 @@ pub unsafe extern "C" fn mma_server_start(
 // ============================================================
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mma_async_request_retain(
-    request: *mut MMA_AsyncRequest,
+pub unsafe extern "C" fn mma_request_retain(
+    request: *mut MMA_Request,
 ) -> i32 {
     if request.is_null() {
         return MMA_INVALID_ARGUMENT;
@@ -1275,7 +1275,7 @@ pub unsafe extern "C" fn mma_async_request_retain(
      */
     unsafe {
         Arc::increment_strong_count(
-            request.cast::<AsyncRequestState>()
+            request.cast::<RequestState>()
         );
     }
 
@@ -1284,8 +1284,8 @@ pub unsafe extern "C" fn mma_async_request_retain(
 
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mma_async_request_release(
-    request: *mut MMA_AsyncRequest,
+pub unsafe extern "C" fn mma_request_release(
+    request: *mut MMA_Request,
 ) {
     if !request.is_null() {
         /*
@@ -1293,7 +1293,7 @@ pub unsafe extern "C" fn mma_async_request_release(
          */
         unsafe {
             Arc::decrement_strong_count(
-                request.cast::<AsyncRequestState>()
+                request.cast::<RequestState>()
             );
         }
     }
@@ -1305,8 +1305,8 @@ pub unsafe extern "C" fn mma_async_request_release(
 // ============================================================
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mma_async_request_get_info(
-    request: *const MMA_AsyncRequest,
+pub unsafe extern "C" fn mma_request_get_info(
+    request: *const MMA_Request,
 
     output: *mut MMA_RequestInfo,
 ) -> i32 {
@@ -1346,8 +1346,8 @@ pub unsafe extern "C" fn mma_async_request_get_info(
 
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mma_async_request_option_count(
-    request: *const MMA_AsyncRequest,
+pub unsafe extern "C" fn mma_request_option_count(
+    request: *const MMA_Request,
 
     output: *mut usize,
 ) -> i32 {
@@ -1372,8 +1372,8 @@ pub unsafe extern "C" fn mma_async_request_option_count(
 
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mma_async_request_option_at(
-    request: *const MMA_AsyncRequest,
+pub unsafe extern "C" fn mma_request_option_at(
+    request: *const MMA_Request,
 
     index: usize,
 
@@ -1423,8 +1423,8 @@ pub unsafe extern "C" fn mma_async_request_option_at(
 // ============================================================
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mma_async_request_is_cancelled(
-    request: *const MMA_AsyncRequest,
+pub unsafe extern "C" fn mma_request_is_cancelled(
+    request: *const MMA_Request,
 
     output: *mut u8,
 ) -> i32 {
@@ -1455,8 +1455,8 @@ pub unsafe extern "C" fn mma_async_request_is_cancelled(
 // ============================================================
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mma_async_request_complete(
-    request: *mut MMA_AsyncRequest,
+pub unsafe extern "C" fn mma_request_complete(
+    request: *mut MMA_Request,
 
     response: *mut MMA_Response,
 ) -> i32 {

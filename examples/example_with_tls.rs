@@ -60,6 +60,10 @@ async fn main() {
         eprint!("Invalid route");
         panic!();
     }
+    if router.register_route(String::from("ECHO"), echo).is_err() {
+        eprint!("Invalid route");
+        panic!();
+    }
     let handle = server.handle();
 
     if router
@@ -121,6 +125,11 @@ async fn main() {
     }
 
     let _ = server.run(router).await;
+}
+
+async fn echo(req: Request, mut res: Response) -> Response {
+    res.payload = req.payload;
+    res
 }
 
 async fn change(_req: Request, res: Response, handle: ServerHandle) -> Response {

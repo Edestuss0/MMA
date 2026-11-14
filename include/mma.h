@@ -37,7 +37,7 @@ enum {
 /* Opaque library-owned objects. Never allocate these in C. */
 typedef struct MMA_Server MMA_Server;
 typedef struct MMA_ServerHandle MMA_ServerHandle;
-typedef struct MMA_AsyncRequest MMA_AsyncRequest;
+typedef struct MMA_Request MMA_Request;
 typedef struct MMA_Response MMA_Response;
 
 typedef struct MMA_BigBytesConfig {
@@ -63,9 +63,10 @@ typedef struct MMA_FramerConfig {
 typedef struct MMA_TLSConfig {
     const char *tls_certificate_path;
     const char *tls_key_path;
-    uint64_t tls_handshake_timeout;
+    uint64_t tls_handshake_timeout; /* milliseconds */
 } MMA_TLSConfig;
 
+/* All *_timeout_ms fields are expressed in milliseconds. */
 typedef struct MMA_ServerConfig {
     const char *bind_ip;
     uint16_t port;
@@ -90,13 +91,23 @@ typedef struct MMA_RequestInfo {
     size_t payload_len;
 } MMA_RequestInfo;
 
-typedef void (*MMA_AsyncRouteCallback)(
-    MMA_AsyncRequest *request,
+/*
+ * Callbacks execute synchronously on Tokio runtime worker threads and must
+ * return quickly. To defer work, call mma_request_retain() inside the callback,
+ * move the request to an application-owned executor, then release it exactly
+ * once after the deferred work is finished.
+ *
+ * Route callbacks must complete the request with mma_request_complete().
+ * Channel and lifecycle callbacks are notifications and do not return a
+ * response.
+ */
+typedef void (*MMA_RouteCallback)(
+    MMA_Request *request,
     void *user_data
 );
 
-typedef void (*MMA_AsyncChannelCallback)(
-    MMA_AsyncRequest *request,
+typedef void (*MMA_ChannelCallback)(
+    MMA_Request *request,
     uint32_t connection_id,
     void *user_data
 );
@@ -104,34 +115,34 @@ typedef void (*MMA_AsyncChannelCallback)(
 /* Server configuration and lifecycle. */
 int32_t mma_server_config_default(MMA_ServerConfig *output);
 int32_t mma_server_create(const MMA_ServerConfig *config, MMA_Server **output);
-int32_t mma_server_register_async_route(
+int32_t mma_server_register_route(
     MMA_Server *server, const uint8_t *route, size_t route_len,
-    MMA_AsyncRouteCallback callback, void *user_data);
-int32_t mma_server_register_async_channel_handler(
+    MMA_RouteCallback callback, void *user_data);
+int32_t mma_server_register_channel_handler(
     MMA_Server *server, const uint8_t *route, size_t route_len,
-    MMA_AsyncChannelCallback callback, void *user_data);
-int32_t mma_server_register_async_on_channel_connect_handler(
-    MMA_Server *server, MMA_AsyncChannelCallback callback, void *user_data);
-int32_t mma_server_register_async_on_channel_disconnect_handler(
-    MMA_Server *server, MMA_AsyncChannelCallback callback, void *user_data);
+    MMA_ChannelCallback callback, void *user_data);
+int32_t mma_server_register_on_channel_connect_handler(
+    MMA_Server *server, MMA_ChannelCallback callback, void *user_data);
+int32_t mma_server_register_on_channel_disconnect_handler(
+    MMA_Server *server, MMA_ChannelCallback callback, void *user_data);
 int32_t mma_server_start(MMA_Server *server);
 int32_t mma_server_local_port(const MMA_Server *server, uint16_t *port);
 int32_t mma_server_stop(MMA_Server *server);
 void mma_server_destroy(MMA_Server *server);
 
 /* Request lifetime and inspection. Retain inside callback before deferring. */
-int32_t mma_async_request_retain(MMA_AsyncRequest *request);
-void mma_async_request_release(MMA_AsyncRequest *request);
-int32_t mma_async_request_get_info(
-    const MMA_AsyncRequest *request, MMA_RequestInfo *output);
-int32_t mma_async_request_option_count(
-    const MMA_AsyncRequest *request, size_t *output);
-int32_t mma_async_request_option_at(
-    const MMA_AsyncRequest *request, size_t index,
+int32_t mma_request_retain(MMA_Request *request);
+void mma_request_release(MMA_Request *request);
+int32_t mma_request_get_info(
+    const MMA_Request *request, MMA_RequestInfo *output);
+int32_t mma_request_option_count(
+    const MMA_Request *request, size_t *output);
+int32_t mma_request_option_at(
+    const MMA_Request *request, size_t index,
     const uint8_t **key, size_t *key_len,
     const uint8_t **value, size_t *value_len);
-int32_t mma_async_request_is_cancelled(
-    const MMA_AsyncRequest *request, uint8_t *output);
+int32_t mma_request_is_cancelled(
+    const MMA_Request *request, uint8_t *output);
 
 /*
  * For route requests, completion consumes response ownership. If the
@@ -139,8 +150,8 @@ int32_t mma_async_request_is_cancelled(
  * consumed. For non-response notifications this returns INVALID_ARGUMENT;
  * in that case the caller retains ownership of response.
  */
-int32_t mma_async_request_complete(
-    MMA_AsyncRequest *request, MMA_Response *response);
+int32_t mma_request_complete(
+    MMA_Request *request, MMA_Response *response);
 
 /* Response construction. Payload and option buffers are copied. */
 MMA_Response *mma_response_new(uint32_t request_id);
@@ -154,9 +165,11 @@ int32_t mma_response_add_option(
 void mma_response_destroy(MMA_Response *response);
 
 /* Server handle operations. */
+/* Obtain a handle only after mma_server_start() has returned MMA_OK. */
 int32_t mma_server_get_handle(
     const MMA_Server *server, MMA_ServerHandle **output);
 void mma_server_handle_destroy(MMA_ServerHandle *handle);
+/* Non-blocking send; message is borrowed and is not consumed. conn_id == 0 broadcasts. */
 int32_t mma_server_handle_send_to_channel(
     const MMA_ServerHandle *handle,
     uint32_t conn_id,

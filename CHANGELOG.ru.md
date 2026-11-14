@@ -12,51 +12,43 @@
 | **Rust** | crate `MMA` (`rlib`) | публичные элементы `src/` |
 | **ABI** | `libMMA` + `include/mma.h` | экспортируемые символы, раскладки структур, контракты callback-ов |
 
-## [Unreleased]
-
-Изменения после `v0.1.4` (коммит `b6b8579`). Предлагаемая версия: **0.2.0** — изменились пути модулей и `Config` (Rust) и размер `MMA_ServerConfig` (C ABI). `MMA_VERSION` остаётся `1`: раскладка кадра и семантика запросов не менялись; TLS оборачивает неизменный поток байтов.
 
 ### Добавлено
 
-- **TLS (серверная сторона)** на `tokio-rustls` 0.26 / rustls, без клиентских сертификатов. *Rust, ABI*
-  - В `Config` добавлено одно поле: `tls_config: Option<TlsConfig>`. `None` отключает TLS; `Some(TlsConfig { tls_certificate_path, tls_key_path, tls_handshake_timeout })` включает TLS.
-  - В C ABI добавлена структура `MMA_TLSConfig` (путь к сертификату, путь к приватному ключу и таймаут рукопожатия в миллисекундах) и одно поле `const MMA_TLSConfig *tls_config` в конце `MMA_ServerConfig`. Размер Rust-структуры `MMA_ServerConfig` с `repr(C)` на x86-64 — 72 байта (вместо 64); размер `MMA_TLSConfig` — 24 байта.
-  - Соединение, не прошедшее рукопожатие или не завершившее его за `tls_handshake_timeout`, закрывается и попадает в лог.
-  - `ServerHandle::change_config` (и `mma_server_handle_change_config`) отклоняет изменение любого поля TLS: `InvalidInput` в Rust, `MMA_SERVER_ERROR` в C.
-- Четыре запускаемых примера сервера: `examples/example_no_tls.rs` и `examples/example_with_tls.rs` для Rust, а также `examples/example_no_tls.c` и `examples/example_with_tls.c` для C ABI. TLS-примеры принимают пути к сертификату и приватному ключу аргументами командной строки. Сертификаты и приватные ключи в репозиторий не включены.
-- В `mma_gui_client.py` появился раздел TLS (транспортная защита, проверка сертификата, имя сервера).
+
+- **Непрозрачный handle запроса и явное управление временем жизни.** `MMA_Request` стал opaque handle; добавлены `mma_request_retain` / `mma_request_release`, позволяющие сохранить запрос после возврата callback. Добавлены `mma_request_get_info`, индексный доступ к options (`mma_request_option_count`, `mma_request_option_at`) и `mma_request_is_cancelled`. *ABI*
+- **Явное асинхронное завершение route.** Теперь route-callback получает `MMA_Request *` и возвращает `void`; C создаёт response через `mma_response_new`, setters и `mma_request_complete`. Завершить запрос можно после возврата callback, предварительно удержав его через `retain`. Добавлены коды `MMA_REQUEST_ALREADY_COMPLETED` и `MMA_REQUEST_CANCELLED`. *ABI*
+- **Непрозрачный response.** `MMA_Response` теперь является opaque-объектом, памятью которого управляет библиотека; setters payload/options копируют входные буферы. Для `mma_request_complete` документировано владение response при успехе, повторном завершении и отмене. *ABI*
+- **Обновлённые C-примеры.** Оба примера используют opaque handle, завершение route, channel/lifecycle notifications, `MMA_ServerHandle` и корректное завершение сервера. TLS-пример задаёт `tls_handshake_timeout` в миллисекундах. *ABI / examples*
+- Добавлен `.gitattributes` с нормализацией текстовых файлов к LF, чтобы диффы оставались стабильными между Windows и Unix. *Репозиторий / tooling*
 
 ### Изменено
 
-- **Rust API (breaking).**
-  - `Config`, `FramerConfig`, `BigBytesConfig`, `ConfigError` и `MMA_VERSION` перенесены из `MMA::core::config` в `MMA::config::config`.
-  - `ServerHandle` перенесён из `core::server` в `core::handle`. `ChannelHub` теперь приватный; в 0.1.4 он был доступен через `core::server`.
-  - `SocketStatus` перенесён из приватного сетевого модуля в `core::commands` и стал публичным.
-  - В `Config` четыре новых поля, поэтому литералы структуры без `..Config::default()` больше не компилируются.
-  - `examples/main_server.rs` заменён Cargo-примерами `no_tls` и `with_tls`; `cargo run --example main_server` больше не работает. C-примеры находятся в `examples/example_no_tls.c` и `examples/example_with_tls.c` (прежняя ссылка на `examples/main_server.c` устарела).
-- `serve_connection` обобщён по типу потока (`AsyncConnection`: `AsyncRead + AsyncWrite + Unpin + Send`), поэтому TLS и обычный TCP используют один путь кода. Внутреннее изменение.
-- README: TLS, актуальные имена и команды сборки Rust/C-примеров, все четыре native release target, новые пути модулей, 72-байтная `MMA_ServerConfig`, правило про SIGPIPE и поведение дубликата route в C API. Прежнее утверждение, что существует `FramerConfig::new()`, было ошибочным; конструктор — `FramerConfig::default()` (`BigBytesConfig::new()` существует).
-- **CI и native release pipeline.** При push, pull request и ручном запуске CI выполняет `cargo test --locked --all-targets`, собирает release-библиотеку и оба Rust-примера, компилирует оба C-примера с C11 и `-Wall -Wextra -Werror`, а также проверяет совместимость `mma.h` с C++17. Для тегов `v*` матрица релизной сборки создаёт пакеты Windows x86-64, Linux x86-64, macOS Intel x86-64 и macOS Apple Silicon arm64. Каждый пакет содержит native-библиотеку и `mma.h`; пакет Windows дополнительно содержит import library MSVC. Для архивов создаются SHA-256-файлы, которые проверяются перед публикацией GitHub Release. *Только CI/release; изменений Wire, Rust API и ABI нет.*
+- **C ABI — несовместимая переработка.** `MMA_Request` и `MMA_Response` больше не являются публичными структурами, передаваемыми по значению. Удалены/заменены старые `MMA_Option`, `MMA_ChannelHandlerCallback`, callback с возвратом `MMA_Response`, alias `mma_server_route` и имя `MMA_RESPONSE_MESSAGE`. Новые callback-и возвращают `void`; channel/lifecycle callback-и получают `MMA_Request *`, `connection_id` и изменяемый `user_data`. Все C/C++ приложения необходимо пересобрать с актуальным `include/mma.h`. *ABI*
+- **Модель выполнения C-callback.** Callback вызывается синхронно из Tokio runtime task; он не переносится в `spawn_blocking`. Блокирующий C-callback занимает worker Tokio и не может быть принудительно прерван через `request_timeout`. Для блокирующего I/O и CPU-задач приложение должно удержать запрос и передать работу в собственный ограниченный executor. *ABI / поведение*
+- **Channel-callback-и являются уведомлениями.** Они не формируют route-response. `mma_request_complete` для channel/lifecycle запроса возвращает `MMA_INVALID_ARGUMENT`; владение response остаётся у вызывающей стороны. *ABI*
+- **Владение запросом и response.** Каждый успешный `retain` должен иметь ровно один `release`. Указатели из request info и option API заимствованы и действительны только пока существует ссылка на запрос. Для корректного route-запроса completion забирает response при `MMA_OK`, `MMA_REQUEST_ALREADY_COMPLETED` и `MMA_REQUEST_CANCELLED`; при `MMA_INVALID_ARGUMENT` response остаётся у вызывающей стороны. *ABI*
+- **Options.** Повторяющиеся ключи теперь разрешены encoder и decoder. Пустые key/value, усечённые записи, несовпадение числа options и лишние байты по-прежнему считаются ошибкой. Если приложению нужна уникальность ключей, оно должно проверять её самостоятельно. *Wire (проверка decoder)*
+- **Framer encoder.** Теперь резервирует оценённую ёмкость кадра и явно увеличивает логическую длину буфера до размера header перед записью его полей. Framer также начинает работу с кешированной копией текущей конфигурации. *Внутренние изменения / производительность и корректность*
+- **Workflow.** CI компилирует C-примеры на Linux и Windows/MSVC, а также проверяет C++-совместимость заголовка, используя opaque pointers вместо попытки создавать объекты непрозрачных типов. Пакеты native release по-прежнему собираются для Windows x86-64, Linux x86-64, macOS x86-64 и macOS arm64. *Только CI/release*
 
-### Известные проблемы
+### Исправлено
 
-Проверено запуском кода (`cargo build --release`, `cargo test --locked --all-targets`: 14 тестов проходят; живые сессии с `examples/with_tls`, `examples/no_tls` и C-программой, покрывающей все 20 экспортируемых функций).
+- В TLS-примере `tls_handshake_timeout` исправлен на миллисекунды (`10000` = 10 секунд).
+- C-примеры игнорируют `SIGPIPE` на POSIX до начала обслуживания соединений: закрытие peer во время записи больше не завершает процесс примера.
+- Удалён неиспользуемый импорт `AHashSet` из Framer.
+- Исправлен комментарий в реализации C API, который ранее неверно описывал поток выполнения callback: вызов выполняется синхронно на worker Tokio.
 
-1. **Ошибки инициализации TLS теперь возвращаются явно.** `Server::from_listener` возвращает `io::Error`, если цепочку сертификатов или приватный ключ не удалось загрузить; C API возвращает `MMA_SERVER_ERROR` из `mma_server_start`. После ошибки инициализации TLS сервер больше не переключается на обычный TCP. *Исправлено в текущем дереве исходников.*
-2. **В `include/mma.h` тип `MMA_TLSConfig` используется до объявления typedef.** `MMA_ServerConfig` содержит `const MMA_TLSConfig *tls_config`, но typedef находится ниже структуры, а предварительного объявления нет. В текущем виде подключение заголовка завершается ошибкой и для C, и для C++; необходимо перенести определение `MMA_TLSConfig` выше `MMA_ServerConfig` либо добавить корректное предварительное объявление именованной структуры. Комментарий над полем также упоминает уже удалённый флаг `tls_enable`: теперь TLS включается наличием ненулевого `tls_config`. C-компиляция примеров и C++ header smoke test в CI будут завершаться ошибкой до исправления заголовка.
-3. **C-хост убивается сигналом `SIGPIPE`.** Запись в сокет, у которого закрыт собеседник, вызывает `SIGPIPE`; C-хост его не игнорирует (Rust-бинарник игнорирует). Подтверждено: процесс-хост завершился со статусом 13, когда отключился клиент с полной очередью push. Обход: `signal(SIGPIPE, SIG_IGN)` до `mma_server_start`. Предлагаемое исправление: игнорировать сигнал внутри библиотеки или отправлять с `MSG_NOSIGNAL`.
-4. В C API дубликат route проходит `mma_server_register_route` (возвращает `MMA_OK`) и падает только в `mma_server_start` с `MMA_SERVER_ERROR`; причина идёт в stderr.
-5. `Config::validate` не проверяет поля TLS.
-6. Комментарий в заголовке говорил, что callbacks выполняются «на worker-потоках рантайма»; на деле они идут в blocking-пуле Tokio (исправлено в приложенном заголовке).
-7. Автотестов на TLS, `ChannelHub`, хуки жизненного цикла и C ABI нет.
-8. Тестовые TLS credentials не входят в репозиторий. Для запуска обоих TLS-примеров предоставьте сертификат и соответствующий приватный ключ; храните приватные ключи вне репозитория и исключайте их из системы контроля версий.
-9. Оставшиеся известные проблемы 0.1.3 и 0.1.4: пользовательский disconnect-хук не вызывается при обрыве TCP; `send_to_channel(0, ..)` блокируется одним не читающим клиентом; нет лимита запросов на соединение.
-10. Предупреждения компилятора: имя crate `MMA` не в snake case, варианты `ReservedRoutes` в верхнем регистре, два неиспользуемых импорта.
-11. Исходники в CRLF; приложен `.gitattributes` с `* text=auto eol=lf`.
+### Миграция
 
-## [0.1.4] - 2026-11-07
+- Пересоберите каждый C/C++-потребитель с новым `include/mma.h` и свяжите его с соответствующей версией `libMMA`. Не смешивайте заголовок из предыдущего snapshot с текущей динамической библиотекой.
+- Вместо прямого доступа к полям request используйте `mma_request_get_info` и `mma_request_option_count` / `mma_request_option_at`.
+- Замените route-callback-и, возвращавшие `MMA_Response`, на `void` callback-и с вызовом `mma_request_complete`.
+- Перед передачей request в другой поток или executor вызовите `mma_request_retain`; каждый успешный `retain` должен иметь ровно один `release`.
+- `mma_server_get_handle` можно вызывать только после успешного `mma_server_start`. Освобождайте handle до уничтожения сервера.
 
-Тег `v0.1.4` (коммит `b6b8579`). Изменения после `v0.1.3` (коммит `95a5abb`). `MMA_VERSION` остаётся `1`; в `Cargo.toml` по-прежнему `0.1.0`.
+
+## [0.1.4] - 0.1.5
 
 ### Изменено
 
@@ -85,16 +77,6 @@
 - Внутренняя ошибка регистрации при connect даёт `InternalError` вместо наполовину открытого канала.
 - Убран отладочный `println!("connect, N")` при каждом подключении к каналу.
 
-### Известные проблемы
-
-1. Клиент, не читающий данные, останавливает `send_to_channel(0, ..)` для всех (см. *Изменено*). Для рассылки недоверенным клиентам используйте `try_send_to_channel` или `tokio::time::timeout`.
-2. `send_to_channel(0, ..)` останавливается на первом неудачном соединении; следующие за ним сообщение не получают.
-3. Пользовательский disconnect-хук вызывается только при явном `CHANNEL_DISCONNECT`, а не при обрыве TCP-соединения. Сообщение, которое хук отправляет в своё же соединение, теряется.
-4. Connect-хук выполняется, пока удерживается разрешение состояния соединения, поэтому медленный хук задерживает следующие кадры этого соединения.
-5. Одно соединение может занять весь бюджет `max_in_flight` (лимита на соединение нет).
-6. Нет автотестов для hub, хуков жизненного цикла и гонки состояния. Существующие 14 тестов проходят. Проверено вручную: `cargo build --release`, `cargo test --locked --all-targets`, C-пример компилируется с `-std=c11 -Wall -Wextra -Werror`, живая сессия с `examples/main_server` (неверный route → `BadRequest`; push connect-хука; повторный connect → `Conflict`; `CHANNEL_DISCONNECT` → соединение закрыто без ответа; `CHANNEL_DISCONNECT` на новом соединении → `BadRequest`; тест с молчащим клиентом выше).
-7. В `Cargo.toml` `version = "0.1.0"`, а теги `v0.1.0`–`v0.1.3` существуют. Теги `v0.1.0`–`v0.1.2` находятся на отдельной ветви истории (Go-биндинги) и не являются предками `master`.
-8. 17 файлов исходников и workflow в CRLF. Добавьте `.gitattributes` (`* text=auto eol=lf`), чтобы диффы оставались читаемыми.
 
 ## [0.1.3] - 2026-11-02
 

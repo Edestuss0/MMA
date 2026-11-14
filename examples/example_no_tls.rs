@@ -51,7 +51,7 @@ async fn main() {
         eprint!("Invalid route");
         panic!();
     }
-     if router.register_route(String::from("echo"), echo).is_err() {
+    if router.register_route(String::from("ECHO"), echo).is_err() {
         eprint!("Invalid route");
         panic!();
     }

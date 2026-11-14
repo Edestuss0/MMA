@@ -12,49 +12,49 @@ Every entry states its impact on the three compatibility surfaces separately (se
 | **Rust** | the `MMA` crate (`rlib`) | public items of `src/` |
 | **ABI** | `libMMA` + `include/mma.h` | exported symbols, struct layouts, callback contracts |
 
-## [Unreleased]
-
-Changes since `v0.1.4` (commit `b6b8579`). Suggested version: **0.2.0** — module paths and `Config` changed (Rust), and `MMA_ServerConfig` changed its size (C ABI). `MMA_VERSION` stays `1`: the frame layout and request semantics are unchanged; TLS wraps the unchanged byte stream.
-
 ### Added
 
-- **TLS (server side)** on top of `tokio-rustls` 0.26 / rustls, without client certificates. *Rust, ABI*
-  - `Config` adds one field: `tls_config: Option<TlsConfig>`. `None` disables TLS; `Some(TlsConfig { tls_certificate_path, tls_key_path, tls_handshake_timeout })` enables it.
-  - The C ABI adds `MMA_TLSConfig` (certificate path, private-key path and handshake timeout in milliseconds) and one `const MMA_TLSConfig *tls_config` field at the end of `MMA_ServerConfig`. The Rust `repr(C)` size of `MMA_ServerConfig` is 72 bytes on x86-64 (up from 64 bytes); `MMA_TLSConfig` is 24 bytes.
-  - A connection that fails the handshake, or does not finish it within `tls_handshake_timeout`, is dropped and logged.
-  - `ServerHandle::change_config` (and `mma_server_handle_change_config`) refuses a change of any TLS field: `InvalidInput` in Rust, `MMA_SERVER_ERROR` in C.
-- Four runnable server examples: `examples/example_no_tls.rs` and `examples/example_with_tls.rs` for Rust, plus `examples/example_no_tls.c` and `examples/example_with_tls.c` for the C ABI. The TLS examples accept certificate and private-key paths as command-line arguments. No certificates or private keys are bundled.
-- `mma_gui_client.py` has a TLS section (transport security, certificate check, server name).
+- **Opaque request handles and explicit request lifetime.** Added `MMA_Request` as an opaque handle and `mma_request_retain` / `mma_request_release` to keep a request alive after its callback returns. Added `mma_request_get_info`, indexed option access (`mma_request_option_count`, `mma_request_option_at`) and `mma_request_is_cancelled`. *ABI*
+- **Explicit asynchronous route completion.** Route callbacks now receive `MMA_Request *` and return `void`; C constructs a response using `mma_response_new`, setters and `mma_request_complete`. Completion can occur after the callback returns, provided the request was retained. Added `MMA_REQUEST_ALREADY_COMPLETED` and `MMA_REQUEST_CANCELLED`. *ABI*
+- **Opaque response objects.** `MMA_Response` is now library-owned and opaque; payload and option setters copy the supplied buffers. `mma_request_complete` documents response ownership on success, duplicate completion and cancellation. *ABI*
+- **Current C examples.** Both C examples demonstrate the opaque-handle API, route completion, channel/lifecycle notifications, `MMA_ServerHandle` and shutdown. The TLS example uses milliseconds for `tls_handshake_timeout`. *ABI / examples*
+- Added `.gitattributes` with LF normalization for text files to keep cross-platform diffs stable. *Repository / tooling*
 
 ### Changed
 
-- **Rust API (breaking).**
-  - `Config`, `FramerConfig`, `BigBytesConfig`, `ConfigError` and `MMA_VERSION` moved from `MMA::core::config` to `MMA::config::config`.
-  - `ServerHandle` moved from `core::server` to `core::handle`. `ChannelHub` is now private (`pub(crate)` module); it was reachable through `core::server` in 0.1.4.
-  - `SocketStatus` moved from the private network module to `core::commands` and is public.
-  - `Config` has four new fields, so struct literals without `..Config::default()` no longer compile.
-  - `examples/main_server.rs` is replaced by the Cargo examples `no_tls` and `with_tls`; `cargo run --example main_server` no longer works. The C examples are `examples/example_no_tls.c` and `examples/example_with_tls.c` (the old `examples/main_server.c` reference is obsolete).
-- `serve_connection` is generic over the stream (`AsyncConnection`: `AsyncRead + AsyncWrite + Unpin + Send`), so TLS and plain TCP share one code path. Internal.
-- README: TLS, current Rust/C example names and build commands, all four native release targets, new module paths, the 72-byte `MMA_ServerConfig`, SIGPIPE rule, and duplicate-route behaviour of the C API. The earlier statement that `FramerConfig::new()` exists was wrong; the constructor is `FramerConfig::default()` (`BigBytesConfig::new()` exists).
-- **CI and native release pipeline.** On pushes, pull requests and manual runs, CI runs `cargo test --locked --all-targets`, builds the release library and both Rust examples, compiles both C examples with C11 plus `-Wall -Wextra -Werror`, and checks that `mma.h` is valid C++17. On `v*` tags, the release matrix builds Windows x86-64, Linux x86-64, macOS Intel x86-64 and macOS Apple Silicon arm64 packages. Each package contains the native library and `mma.h`; the Windows package also contains the MSVC import library. SHA-256 checksum files are generated and verified before publishing the GitHub Release. *CI/release only; no Wire, Rust API or ABI change.*
+- **C ABI — breaking redesign.** `MMA_Request` and `MMA_Response` are no longer public by-value structs. The old `MMA_Option`, `MMA_ChannelHandlerCallback`, callback-returned `MMA_Response`, `mma_server_route` alias and `MMA_RESPONSE_MESSAGE` name are removed/replaced. New callbacks return `void`; channel/lifecycle callbacks receive `MMA_Request *`, `connection_id` and mutable `user_data`. Recompile all C and C++ consumers with the current `include/mma.h`. *ABI*
+- **C callback execution model.** Callbacks are called synchronously from the server's Tokio runtime tasks; they are not dispatched to `spawn_blocking`. A blocking C callback occupies a Tokio worker and cannot be forcibly interrupted by `request_timeout`. Applications that need blocking I/O or CPU work must retain the request and dispatch work to their own bounded executor. *ABI / behaviour*
+- **Channel callbacks are notifications.** They do not produce a route response. `mma_request_complete` on a channel/lifecycle request returns `MMA_INVALID_ARGUMENT`, and the caller retains ownership of the response. *ABI*
+- **Request/response ownership.** Each successful retain must be balanced by one release. Request-info and option pointers are borrowed and remain valid only while a request reference is held. Completion consumes the response for valid route requests on `MMA_OK`, `MMA_REQUEST_ALREADY_COMPLETED` and `MMA_REQUEST_CANCELLED`; on `MMA_INVALID_ARGUMENT`, the caller retains it. *ABI*
+- **Options.** Duplicate option keys are now accepted by the encoder and decoder. Empty keys/values, truncated entries, wrong counts and trailing option bytes remain invalid. Applications that depended on uniqueness must enforce it themselves. *Wire (decoder validation)*
+- **Framer encoder.** It now reserves the estimated frame capacity and explicitly extends the destination buffer to the header length before writing header fields. The Framer also starts with a cached copy of the current configuration. *Internal / performance and correctness*
+- **Workflow.** CI now compiles the public C examples on Linux and Windows/MSVC and checks the header as C++ using opaque pointers rather than attempting to instantiate opaque request/response types. Native release packages remain available for Windows x86-64, Linux x86-64, macOS x86-64 and macOS arm64. *CI/release only*
 
-### Known issues
+### Fixed
 
-Verified by running the code (`cargo build --release`, `cargo test --locked --all-targets`: 14 tests pass; live sessions against `examples/with_tls`, `examples/no_tls` and a C program covering all 20 exported functions).
 
-1. **TLS initialization now fails explicitly.** `Server::from_listener` returns an `io::Error` if the certificate chain or private key cannot be loaded; the C API reports `MMA_SERVER_ERROR` from `mma_server_start`. It no longer falls back to plain TCP after TLS initialization fails. *Fixed in the current source tree.*
-2. **`include/mma.h` uses `MMA_TLSConfig` before declaring the typedef.** `MMA_ServerConfig` contains `const MMA_TLSConfig *tls_config`, but the typedef appears below the structure and there is no forward declaration. As written, including the header fails in both C and C++; move the `MMA_TLSConfig` definition above `MMA_ServerConfig` or add a valid named forward declaration. The comment above the field also still mentions the removed `tls_enable` flag; TLS is now controlled by whether `tls_config` is `NULL`. The C-example compile and C++ header-smoke steps in CI will remain red until the header is fixed.
-3. **C hosts are killed by `SIGPIPE`.** Writing to a socket whose peer has closed raises `SIGPIPE`; a C host does not ignore it (a Rust binary does). Observed: the host process exited with status 13 when a client with a full push queue disconnected. Workaround: `signal(SIGPIPE, SIG_IGN)` before `mma_server_start`. Suggested fix: ignore the signal inside the library or send with `MSG_NOSIGNAL`.
-4. In the C API a duplicate route passes `mma_server_register_route` (returns `MMA_OK`) and fails only at `mma_server_start` with `MMA_SERVER_ERROR`; the reason goes to stderr.
-5. `Config::validate` ignores the TLS fields.
-6. The header comment said callbacks run "on runtime worker threads"; they run on Tokio's blocking pool (corrected in the provided header).
-7. No automated tests cover TLS, `ChannelHub`, the lifecycle hooks or the C ABI.
-8. TLS credentials are not bundled. Supply a certificate and matching private key when running either TLS example; keep private keys outside the repository and exclude them from version control.
-9. The earlier 0.1.3 and 0.1.4 known issues that remain: the user's disconnect hook does not run when a TCP connection is dropped; `send_to_channel(0, ..)` is blocked by one non-reading client; no per-connection in-flight cap.
-10. Compiler warnings: crate name `MMA` is not snake case, `ReservedRoutes` variants are upper case, two unused imports.
-11. Source files use CRLF line endings; `.gitattributes` with `* text=auto eol=lf` is provided.
+- Corrected the TLS example's `tls_handshake_timeout` value to milliseconds (`10000` = 10 seconds).
+- C examples ignore `SIGPIPE` on POSIX systems before serving connections, so a peer closing during a write does not terminate the example host process.
+- Removed the unused `AHashSet` import from the Framer.
+- Corrected the C API implementation comment that previously described callbacks as running away from the runtime thread; callback invocation is synchronous on Tokio workers.
 
-## [0.1.4] - 2026-11-07
+### Migration notes
+
+- Rebuild every C/C++ consumer with the new `include/mma.h` and link it to the matching `libMMA` binary. Do not mix a header from the previous snapshot with the current shared library.
+- Replace by-value request access with `mma_request_get_info` and `mma_request_option_count` / `mma_request_option_at`.
+- Replace route callbacks returning `MMA_Response` with `void` callbacks that call `mma_request_complete`.
+- Use `mma_request_retain` before handing a request to another thread or executor; pair every successful retain with exactly one release.
+- `mma_server_get_handle` is valid only after `mma_server_start` succeeds. Destroy the returned handle before destroying the server.
+
+### Remaining limitations
+
+- A synchronous C callback cannot be interrupted. If it blocks, it delays the Tokio worker currently executing it and may delay server shutdown.
+- The C ABI has no runtime ABI-version query or structured last-error string; check return codes and stderr diagnostics.
+- The user disconnect hook is not invoked for a peer that disappears without sending the explicit `CHANNEL_DISCONNECT` frame.
+- `send_to_channel(0, ..)` uses a non-waiting per-channel queue path from the C handle API but reports an error if a broadcast is only partially accepted; it does not provide durable delivery or retry semantics.
+- The `Cargo.toml` package version remains `0.1.0` in this source snapshot, while the Git tags reach `v0.1.4`. Update the crate version deliberately when preparing the next release.
+
+## [0.1.4] - 0.1.5
 
 Tag `v0.1.4` (commit `b6b8579`). Changes since `v0.1.3` (commit `95a5abb`). `MMA_VERSION` stays `1`; `Cargo.toml` still says `0.1.0`.
 
@@ -84,17 +84,6 @@ Tag `v0.1.4` (commit `b6b8579`). Changes since `v0.1.3` (commit `95a5abb`). `MMA
 - **Hook panics are contained.** A panic in the connect hook rolls back the channel registration and answers `InternalError`; a panic in the disconnect hook answers `InternalError`.
 - A connect with an internal registration error answers `InternalError` instead of a half-open channel.
 - Removed the debug `println!("connect, N")` on every channel connect.
-
-### Known issues
-
-1. A client that does not read stalls `send_to_channel(0, ..)` for everybody (see *Changed*). Use `try_send_to_channel`, or `tokio::time::timeout`, for broadcasts to untrusted clients.
-2. `send_to_channel(0, ..)` stops at the first failing connection; the connections after it do not get the message.
-3. The user's disconnect hook runs only for an explicit `CHANNEL_DISCONNECT`, not for a dropped TCP connection. A message that the hook sends to its own connection is lost.
-4. A connect hook runs while the connection's state permit is held, so a slow hook delays the next frames of that connection.
-5. One connection can occupy the whole `max_in_flight` budget (no per-connection cap).
-6. No automated tests for the hub, the lifecycle hooks or the state race. The 14 existing tests pass. Verified manually: `cargo build --release`, `cargo test --locked --all-targets`, the C example compiles with `-std=c11 -Wall -Wextra -Werror`, and a live session against `examples/main_server` (wrong route → `BadRequest`; connect hook push; second connect → `Conflict`; `CHANNEL_DISCONNECT` → connection closed with no reply; `CHANNEL_DISCONNECT` on a fresh connection → `BadRequest`; the silent-client test above).
-7. `Cargo.toml` has `version = "0.1.0"` while tags `v0.1.0`–`v0.1.3` exist. Tags `v0.1.0`–`v0.1.2` are on a separate line of history (Go bindings) and are not ancestors of `master`.
-8. 17 source and workflow files use CRLF line endings. Add a `.gitattributes` (`* text=auto eol=lf`) so the diffs stay readable.
 
 ## [0.1.3] - 2026-11-02
 

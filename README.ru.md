@@ -151,7 +151,7 @@ for source in examples/example_no_tls.c examples/example_with_tls.c; do
     cc \
         -std=c11 \
         -D_POSIX_C_SOURCE=200809L \
-        -Wall -Wextra -Werror \
+        -Wall -Wextra -Wpedantic -Werror \
         -I include \
         "$source" \
         -L target/release \
@@ -307,7 +307,7 @@ frame_len = header_length + body_len                 (checked-сложение)
 | Переполнение длины | `BadRequest` | закрывается |
 | Неизвестный opcode запроса | `BadRequest` | закрывается |
 | Route — не валидный UTF-8 | `BadRequest` | закрывается |
-| Некорректные options (пустой key/value, дубликат ключа, лишние байты, неверное число) | `BadRequest` | закрывается |
+| Некорректные options (пустой key/value, усечённые данные, лишние байты, неверное число) | `BadRequest` | закрывается |
 | Неверная `version` | `BadRequest` (`"Incorrect protocol version"`) | остаётся открытым |
 
 После ошибки декодирования поток нельзя пересинхронизировать, поэтому соединение закрывается. `BadRequest` содержит `req_id` из заголовка, если его удалось прочитать, иначе `0`.
@@ -323,7 +323,7 @@ Options — именованные параметры кадра (метадан
 | Ключ | произвольные байты, чувствителен к регистру, 1–65535 байт |
 | Значение | произвольные байты, 1–65535 байт |
 | Пустой ключ или значение | отклоняется |
-| Повторяющиеся ключи | отклоняются |
+| Повторяющиеся ключи | разрешены; порядок сохраняется |
 | Количество | 0–255 на кадр |
 | Неизвестные ключи | библиотека игнорирует; доступны в `Request.options` |
 
@@ -376,7 +376,7 @@ options_key_first = false:  [key_len u16 BE][value_len u16 BE][value][key]
 |---|---|---|---|
 | `Fresh` | `Once` | route-обработчик | `Once` |
 | `Fresh` | `ChannelConnect`, route `CHANNEL_CONNECT` | `ChannelConnected`; запускается connect-хук | `Channel` |
-| `Fresh` | `ChannelConnect`, любой другой route | `BadRequest` («Route must be doesn't match by opcode») | `Fresh` |
+| `Fresh` | `ChannelConnect`, любой другой route | `BadRequest` («Route must match the opcode») | `Fresh` |
 | `Fresh` | `ChannelMessage` | `BadRequest` («Channel not connected») | `Fresh` |
 | `Once` | `Once` | route-обработчик | `Once` |
 | `Once` | `ChannelConnect` / `ChannelMessage` | `BadRequest` (несовпадение типа) | `Once` |
@@ -633,150 +633,236 @@ router.register_on_channel_disconnect_handler(|req: Request, conn_id: u32| async
 
 ## 8. C ABI
 
-Заголовок: [`include/mma.h`](include/mma.h). Для каждого тега `v*` GitHub Release получает четыре native-пакета. Каждый архив содержит динамическую библиотеку и `mma.h`; архив Windows дополнительно включает импортную библиотеку MSVC. Рядом с каждым архивом публикуется файл контрольной суммы `.sha256`.
+Публичный интерфейс C определён в [`include/mma.h`](include/mma.h). Текущая версия — **API с непрозрачными handle и callback-функциями**: C-код не выделяет память под `MMA_Server`, `MMA_ServerHandle`, `MMA_Request` или `MMA_Response` и не обращается к их внутренним полям.
 
-| Платформа | Release asset |
-|---|---|
-| Windows x86-64 | `mma-native-windows-amd64.zip` |
-| Linux x86-64 | `mma-native-linux-amd64.zip` |
-| macOS Intel x86-64 | `mma-native-darwin-amd64.zip` |
-| macOS Apple Silicon arm64 | `mma-native-darwin-arm64.zip` |
+Для каждого тега `v*` GitHub Release публикует native-пакеты Windows x86-64, Linux x86-64, macOS Intel x86-64 и macOS Apple Silicon arm64. Каждый архив содержит динамическую библиотеку и `mma.h`; Windows дополнительно содержит `MMA.dll.lib`. Рядом публикуется SHA-256-файл.
 
-Локальная команда `cargo build --release` создаёт `libMMA.so` / `libMMA.dylib` / `MMA.dll` и `libMMA.a` в `target/release/`. Проверки заголовка C/C++ в текущем workflow выявляют описанную ниже проблему с порядком объявления `MMA_TLSConfig`; до исправления заголовка они не пройдут. В проекте подтверждена native-сборка только для Linux x86-64.
+### 8.1. Сборка и линковка
 
-### 8.1. Функции
+Сначала соберите библиотеку:
 
-| Функция | Назначение | Примечания |
-|---|---|---|
-| `mma_server_config_default` | заполняет `MMA_ServerConfig` значениями по умолчанию | `bind_ip` указывает на статическую `"0.0.0.0"`; TLS выключен, указатели `NULL` |
-| `mma_server_create` | проверяет конфигурацию, создаёт сервер (bind ещё нет) | освобождать `mma_server_destroy`; копирует нужные ему строки |
-| `mma_server_register_route` | регистрирует обработчик запрос/ответ | до `start`; route копируется. **Дубликат** route здесь не обнаруживается: `mma_server_start` вернёт `MMA_SERVER_ERROR` и напечатает причину в stderr. Пустой route и `NULL`-сервер дают ошибку сразу |
-| `mma_server_register_channel_handler` | регистрирует channel-обработчик | до `start` |
-| `mma_server_register_on_channel_connect_handler` | регистрирует глобальный connect-хук | до `start`; один хук, повторный вызов заменяет его |
-| `mma_server_register_on_channel_disconnect_handler` | регистрирует глобальный disconnect-хук | до `start`; один хук, повторный вызов заменяет его |
-| `mma_server_route` | алиас `mma_server_register_route` | |
-| `mma_server_start` | запускает OS-поток и Tokio runtime, выполняет bind, ждёт готовности | `MMA_OK` только после успешного bind |
-| `mma_server_local_port` | возвращает порт | вызывать после `start` |
-| `mma_server_get_handle` | получает handle сервера (клон `ServerHandle`) | после `start`; освобождать `mma_server_handle_destroy` |
-| `mma_server_handle_send_to_channel` | отправляет response в каналы без ожидания | `conn_id == 0` — рассылка всем; `MMA_SERVER_ERROR`, если получатель неизвестен, его очередь (256) полна или рассылка принята частично |
-| `mma_server_handle_change_config` | отправляет новую конфигурацию работающему серверу | не все поля применяются на лету; для неверной конфигурации — `MMA_INVALID_CONFIG`, при отличии поля TLS — `MMA_SERVER_ERROR` |
-| `mma_server_handle_destroy` | освобождает handle | сервер не останавливает |
-| `mma_server_stop` | отменяет работу и ждёт поток сервера | не вызывать из callback этого же сервера |
-| `mma_server_destroy` | освобождает сервер (внутри вызывает `stop`) | `NULL` допустим |
-| `mma_response_new` / `mma_response_destroy` | создаёт / освобождает самостоятельный response | для сообщений вне callback |
-| `mma_response_set_status` | задаёт opcode ответа | возвращает response; `inner == NULL` при ошибке |
-| `mma_response_set_payload` | задаёт payload (копируется) | |
-| `mma_response_add_option` | добавляет option (копируется) | key/value непустые, ≤ 65535 байт, ≤ 255 options |
-
-Настройки TLS вынесены в отдельную структуру `MMA_TLSConfig`; `MMA_ServerConfig` хранит указатель на неё:
-
-```c
-typedef struct {
-    const char *tls_certificate_path;
-    const char *tls_key_path;
-    uint64_t tls_handshake_timeout; /* миллисекунды */
-} MMA_TLSConfig;
-
-typedef struct {
-    /* ... bind_ip, port, max_batch, max_in_flight, framer, max_connections,
-       drain_timeout_ms, shutdown_grace_ms, request_timeout_ms ... */
-    const MMA_TLSConfig *tls_config; /* NULL = обычный TCP */
-} MMA_ServerConfig;
+```bash
+cargo build --locked --release --lib
 ```
 
-Создайте `MMA_TLSConfig` до вызова `mma_server_create`, затем задайте `config.tls_config = &tls_config`. `mma_server_config_default` устанавливает указатель в `NULL`. Размер Rust-структуры `MMA_ServerConfig` с `repr(C)` на x86-64 — 72 байта, а `MMA_TLSConfig` — 24 байта. Библиотека копирует строки сертификата и ключа во время `mma_server_create`, поэтому локальную структуру и строки можно освободить после возврата вызова. Если сертификат или ключ не удаётся загрузить, `mma_server_start` возвращает `MMA_SERVER_ERROR`, а не запускает обычный TCP.
+Пример для Linux (для TLS замените `example_no_tls.c` на `example_with_tls.c`):
 
-> **Текущая проблема заголовка:** в этой версии `include/mma.h` использует `MMA_TLSConfig` внутри `MMA_ServerConfig` до объявления typedef. Порядок объявлений в примере выше является правильным: перенесите typedef `MMA_TLSConfig` выше `MMA_ServerConfig` (либо добавьте корректное предварительное объявление именованной структуры). В заголовке также остался устаревший комментарий с `tls_enable`; теперь TLS включается ненулевым указателем `tls_config`. Пока заголовок не исправлен, компиляция C-примеров и C++ header smoke test в CI будет завершаться ошибкой.
+```bash
+cc -std=c11 -D_POSIX_C_SOURCE=200809L \
+    -Wall -Wextra -Wpedantic -Werror \
+    -Iinclude examples/example_no_tls.c \
+    -Ltarget/release -Wl,-rpath,"$PWD/target/release" \
+    -lMMA -pthread -o basic_server
 
-### 8.2. Коды ошибок
-
-| Код | Имя | Значение |
-|---:|---|---|
-| 0 | `MMA_OK` | успех |
-| −1 | `MMA_INVALID_ARGUMENT` | `NULL` или неверный аргумент (например, route не UTF-8) |
-| −2 | `MMA_INVALID_CONFIG` | конфигурация отклонена или неверный `bind_ip` |
-| −3 | `MMA_SERVER_ERROR` | ошибка потока/runtime/bind |
-| −4 | `MMA_SERVER_ALREADY_STARTED` | уже запущен |
-
-Ошибки возвращаются только кодом возврата; API last-error нет. Сбой внутри route-callback доходит до клиента как `InternalError` и не виден C-коду.
-
-### 8.3. Callbacks
-
-```c
-typedef MMA_Response (*MMA_RouteCallback)(
-    MMA_Request request, MMA_Response response, const void *user_data);
-
-typedef int32_t (*MMA_ChannelHandlerCallback)(
-    const MMA_Request *request, uint32_t connection_id, const void *user_data);
+./basic_server
 ```
 
-Хуки жизненного цикла тоже используют `MMA_ChannelHandlerCallback`; они регистрируются без имени route и получают запрос `CHANNEL_CONNECT` / `CHANNEL_DISCONNECT` ([§5.5](#55-зарезервированные-маршруты-и-хуки-жизненного-цикла-соединения)):
+В Windows используйте MSVC target и import library, созданную Cargo. Пример с LLVM Clang, настроенным на MSVC toolchain:
 
-```c
-mma_server_register_on_channel_connect_handler(server, on_connect, &state);
-mma_server_register_on_channel_disconnect_handler(server, on_disconnect, &state);
+```powershell
+cargo build --locked --release --lib
+
+clang --target=x86_64-pc-windows-msvc `
+    -fuse-ld=link `
+    -std=c11 -O2 `
+    -Wall -Wextra -Wpedantic -Werror `
+    -Iinclude `
+    examples/example_no_tls.c `
+    target/release/MMA.dll.lib `
+    -o basic_server.exe
+
+Copy-Item .\target\release\MMA.dll .\MMA.dll -Force
+.\basic_server.exe
 ```
 
-Route-callback — **функциональный**: получает пустой `MMA_Response`, применяет вызовы `mma_response_*` (каждый возвращает обновлённый response) и возвращает его.
+Для TLS вместо `example_no_tls.c` соберите `example_with_tls.c`, затем передайте пути к PEM-сертификату и приватному ключу:
 
-Правила:
+```powershell
+.\basic_server.exe server.crt server.key
+```
 
-- Данные `request` (`payload`, `route`, `options`) **заимствованы и действительны только во время callback**. Нужное — копируйте.
-- Callbacks выполняются **параллельно в blocking-пуле Tokio**, а не на асинхронных worker-потоках. Одновременно работает не более `min(max_in_flight, 128)` C-callbacks (route, channel-обработчики и хуки вместе); остальные запросы ждут свободный слот, и это ожидание входит в `request_timeout`. Синхронизируйте общий `user_data` и держите его живым до возврата `mma_server_stop`.
-- Медленный callback больше не блокирует асинхронные worker-ы, но удерживает свой слот до возврата: по `request_timeout` клиент получает `Timeout`, но сама C-функция не прерывается.
-- Не вызывайте `mma_server_*` из callback; не выбрасывайте исключения C++ и не делайте `longjmp` наружу.
-- Чтобы сообщить об ошибке, верните response с `inner == NULL` (или пусть сработает ошибка setter) — клиент получит `InternalError`.
-- Возвращаемое значение callback-ов channel и хуков клиенту не передаётся; значение, отличное от `MMA_OK`, только пишется в stderr.
-- Владение: внутри route-callback response принадлежит библиотеке — верните его, не уничтожайте. Response, созданный `mma_response_new`, требует ровно один `mma_response_destroy`.
+Поле `MMA_TLSConfig.tls_handshake_timeout` задаётся в **миллисекундах** (`10000` — 10 секунд). DLL `MMA.dll` должна находиться рядом с исполняемым файлом либо в каталоге поиска Windows. На macOS используется `libMMA.dylib`; настройте `@rpath` или `DYLD_LIBRARY_PATH`.
 
-### 8.4. Строки и буферы
+### 8.2. Модель API и жизненный цикл сервера
 
-| Параметр | Длина | NUL | Кодировка | Время жизни |
-|---|---|---|---|---|
-| `bind_ip` | NUL-terminated | да | текст IPv4/IPv6 | читается только во время вызова |
-| `route` | `route_len` | нет | UTF-8, ≤ 255 | копируется |
-| `request.payload`, `request.route`, `request.options[i]` | явная длина | нет | байты (route — UTF-8) | только во время callback |
-| данные для `mma_response_*` | явная длина | нет | байты | копируются; освободить можно после вызова |
+Стандартная последовательность работы:
 
-### 8.5. Соответствие типов
+1. Вызвать `mma_server_config_default`, чтобы заполнить конфигурацию значениями по умолчанию.
+2. Изменить нужные поля; для TLS установить `tls_config` в адрес корректной `MMA_TLSConfig`.
+3. Вызвать `mma_server_create`.
+4. Зарегистрировать route-обработчики, channel-обработчики и необязательные connect/disconnect hooks. Регистрация выполняется до запуска.
+5. Вызвать `mma_server_start`. Функция запускает Tokio runtime в отдельном системном потоке и возвращает управление после готовности listener.
+6. Только **после успешного `mma_server_start`** вызвать `mma_server_get_handle`, если callback-ам требуется отправлять сообщения в каналы или менять конфигурацию. `mma_server_local_port` также вызывается после запуска.
+7. При завершении вызвать `mma_server_stop`, освободить handle через `mma_server_handle_destroy`, затем освободить сервер через `mma_server_destroy`.
 
-| Rust | C |
-|---|---|
-| `u8` / `u16` / `u32` / `u64` | `uint8_t` / `uint16_t` / `uint32_t` / `uint64_t` |
-| `bool` | `uint8_t` (только 0 или 1) |
-| `Duration` | `uint64_t`, миллисекунды (`*_ms`) |
-| `SocketAddr` | `const char *bind_ip` + `uint16_t port` (порт 0 отклоняется) |
-| `Bytes` | `const uint8_t *` + `size_t` (заимствование) |
-| `String` (route) | `const uint8_t *` + `size_t`, UTF-8, без NUL |
-| `Vec<(Bytes, Bytes)>` | `const MMA_Option *` + `size_t` |
-| `ResponseOpcode` | `uint8_t`, константы `MMA_RESPONSE_*` |
-| `Server` / `ServerHandle` / `Response` | `MMA_Server *` / `MMA_ServerHandle *` / `MMA_Response` |
+Объект сервера рассчитан на один запуск. Не вызывайте `start` повторно, а также не вызывайте `stop`/`destroy` конкурентно для одного указателя. `mma_server_get_handle` вернёт ошибку, если сервер не запущен, runtime-поток завершился или внутренний handle недоступен.
 
-### 8.6. Правила времени жизни
+### 8.3. Непрозрачный запрос и типы callback
 
-- `create` → регистрация маршрутов → `start` → … → `stop` → `destroy`.
-- Не вызывайте `start`, `stop`, `destroy` конкурентно для одного указателя и не используйте указатель после `destroy`. Библиотека не обнаруживает double-free и use-after-free.
-- `mma_server_stop` завершает поток сервера и ждёт его. При уничтожении runtime дожидаются уже запущенные C-callbacks, поэтому `stop` может длиться дольше `shutdown_grace`, пока callback не вернулся. Синхронную C-функцию прервать нельзя.
-- Строка `bind_ip` в `MMA_ServerConfig` и строки сертификата/ключа в переданной структуре `MMA_TLSConfig` читаются и копируются внутри `mma_server_create` и `mma_server_handle_change_config`; их можно освободить после возврата этих вызовов.
-- **В C-хосте игнорируйте `SIGPIPE`** (`signal(SIGPIPE, SIG_IGN)`) до запуска сервера. Библиотека пишет в сокеты обычным `write`; если клиент закрыл соединение, пока сервер ещё отправляет данные, действие `SIGPIPE` по умолчанию завершает весь процесс. Rust-программы не затронуты: рантайм Rust игнорирует этот сигнал. Наблюдалось: C-хост завершился со статусом 13, когда отключился клиент с полной очередью push.
-- `mma_server_handle_change_config`: новые `FramerConfig` и `request_timeout` подхватываются соединениями; `max_batch`, `max_connections`, `max_in_flight`, адрес listener и `shutdown_grace` **не** обновляются. Смена wire-параметров без одновременного переключения клиентов ломает разбор.
+Новые callback-и возвращают `void`:
 
-### 8.7. Пример
+```c
+typedef void (*MMA_RouteCallback)(MMA_Request *request, void *user_data);
+typedef void (*MMA_ChannelCallback)(
+    MMA_Request *request,
+    uint32_t connection_id,
+    void *user_data
+);
+```
 
-Полные примеры на C — [`examples/example_no_tls.c`](examples/example_no_tls.c) и [`examples/example_with_tls.c`](examples/example_with_tls.c). Они демонстрируют один и тот же API маршрутов и каналов поверх обычного TCP и TLS, включая хуки жизненного цикла соединения, обработку сигналов и управление `MMA_ServerHandle`. TLS-пример принимает пути к сертификату и приватному ключу аргументами командной строки.
+- Route-callback обрабатывает `Once`-запрос и должен завершить его вызовом `mma_request_complete`.
+- Callback канала обрабатывает сообщение в канале или уведомление о жизненном цикле. Он получает `connection_id` и **не возвращает response**.
+- Connect/disconnect hooks используют `MMA_ChannelCallback` и регистрируются глобально, без имени route.
+- `user_data` передаётся callback-у без копирования. Если несколько callback-ов обращаются к общему изменяемому состоянию, синхронизируйте доступ и сохраняйте объект `user_data` живым до остановки сервера и завершения callback-ов.
+
+Callback-и вызываются **синхронно на worker-потоках Tokio runtime**. Они не переносятся в C worker pool или `spawn_blocking`. Callback должен быстро вернуть управление и не выполнять блокирующий I/O или тяжёлую CPU-работу. Пока C-функция выполняется, она занимает runtime worker; `request_timeout` не может принудительно прервать выполняющуюся C-функцию. Для блокирующего I/O или CPU-задач удержите запрос через `retain`, поставьте задачу в собственный ограниченный worker pool и вернитесь из callback.
+
+`MMA_Request` — непрозрачный тип. Получать данные можно только через функции API:
+
+- `mma_request_get_info` заполняет `MMA_RequestInfo`: route, opcode, version, request ID и указатель/длину payload.
+- `mma_request_option_count` возвращает число options.
+- `mma_request_option_at` возвращает указатели и длины key/value для указанного индекса. Текущий wire decoder допускает повторяющиеся ключи; перебирайте options по индексу и не рассчитывайте на уникальность ключа.
+- `mma_request_is_cancelled` позволяет проверить отмену удерживаемого route-запроса, например после timeout или shutdown.
+
+Указатели на route и payload из `MMA_RequestInfo`, а также на key/value из `mma_request_option_at`, **заимствованы**. Они действительны, пока живёт соответствующая ссылка на запрос. Скопируйте данные, если они должны пережить эту ссылку.
+
+### 8.4. Завершение route-запроса
+
+Если обработка короткая, callback может прочитать запрос, создать response и завершить запрос до своего возврата:
 
 ```c
 #include "mma.h"
 
-static MMA_Response echo(MMA_Request req, MMA_Response res, const void *ud) {
-    (void)ud;
-    res = mma_response_set_status(res, MMA_RESPONSE_OK);
-    if (res.inner == NULL) return res;
-    return mma_response_set_payload(res, req.payload, req.payload_len);
+static void echo_route(MMA_Request *request, void *user_data)
+{
+    (void)user_data;
+
+    MMA_RequestInfo info;
+    if (mma_request_get_info(request, &info) != MMA_OK) {
+        return;
+    }
+
+    MMA_Response *response = mma_response_new(info.request_id);
+    if (response == NULL) {
+        return;
+    }
+
+    int32_t rc = mma_response_set_status(response, MMA_RESPONSE_OK);
+    if (rc == MMA_OK) {
+        rc = mma_response_set_payload(response, info.payload, info.payload_len);
+    }
+    if (rc != MMA_OK) {
+        mma_response_destroy(response);
+        return;
+    }
+
+    rc = mma_request_complete(request, response);
+    if (rc == MMA_INVALID_ARGUMENT) {
+        /* Владение не передано библиотеке. */
+        mma_response_destroy(response);
+    }
+    /* При OK, ALREADY_COMPLETED и CANCELLED response уже потреблён. */
 }
 ```
 
-Wire-раскладка задаётся через `config.framer` (`MMA_FramerConfig`) и должна совпадать с клиентской.
+`mma_response_set_payload` и `mma_response_add_option` **копируют** переданные буферы. `mma_response_new` создаёт непрозрачный response, управляемый библиотекой; не выделяйте и не изменяйте его напрямую.
+
+У `mma_request_complete` строгое правило владения:
+
+- Для корректного route-запроса библиотека забирает `response` при `MMA_OK`, `MMA_REQUEST_ALREADY_COMPLETED` и `MMA_REQUEST_CANCELLED`.
+- При `MMA_INVALID_ARGUMENT` владение остаётся у вызывающей стороны; созданный response необходимо уничтожить.
+- Channel/lifecycle notification не ожидает response. Вызов `mma_request_complete` для него вернёт `MMA_INVALID_ARGUMENT`; response остаётся у вызывающей стороны.
+- Route-запрос можно завершить только один раз. Повторный вызов возвращает `MMA_REQUEST_ALREADY_COMPLETED`.
+
+Если создать response не удалось или callback вернулся без завершения запроса, запрос остаётся ожидающим до `request_timeout` или shutdown. При timeout сервер отправляет ответ `TIMEOUT`; сохранённый route-запрос может проверить отмену через `mma_request_is_cancelled`.
+
+### 8.5. Отложенная работа: `retain` / `release`
+
+Указатель на запрос действителен во время callback. Чтобы использовать его после возврата callback, получите дополнительную ссылку **внутри callback**:
+
+```c
+static void route_callback(MMA_Request *request, void *user_data)
+{
+    if (mma_request_retain(request) != MMA_OK) {
+        return;
+    }
+
+    /* Псевдокод: submit_to_bounded_pool(worker, request, user_data). */
+    if (!submit_to_bounded_pool(request, user_data)) {
+        mma_request_release(request);
+    }
+}
+
+static void worker(MMA_Request *request, void *user_data)
+{
+    /* Прочитать/скопировать данные, создать response и вызвать complete(). */
+    /* ... */
+    mma_request_release(request);
+}
+```
+
+`retain` увеличивает внутренний счётчик ссылок; он **не копирует** запрос или payload. Каждый успешный `mma_request_retain` должен иметь ровно один соответствующий `mma_request_release`, в том числе при ошибке постановки в очередь и при отмене задачи. Освобождайте запрос только после того, как worker закончил работу с запросом и всеми заимствованными указателями. После освобождения своей последней ссылки нельзя обращаться к указателю.
+
+Для удерживаемого route-запроса проверяйте `mma_request_is_cancelled` до дорогой работы или позднего завершения. Отмена не останавливает пользовательский worker автоматически: приложение должно само заметить отмену и прекратить свою работу.
+
+### 8.6. Channel-сообщения и server handle
+
+Callback-и канала и lifecycle hooks — это уведомления. Указатель `MMA_Request` предоставляет те же функции чтения, но `mma_request_complete` для них недопустим. Вызовите `retain`, если запрос нужно обработать после возврата callback.
+
+Получайте handle только после успешного `mma_server_start`:
+
+```c
+MMA_ServerHandle *handle = NULL;
+int32_t rc = mma_server_get_handle(server, &handle);
+if (rc != MMA_OK || handle == NULL) {
+    /* Не удалось получить handle. */
+}
+```
+
+Для отправки сообщения используйте `mma_server_handle_send_to_channel`. Функция использует **неблокирующую отправку**. `conn_id == 0` рассылает сообщение всем channel-соединениям; ненулевой ID выбирает одно соединение. Библиотека копирует response через внутренний clone, поэтому после вызова вызывающая сторона может уничтожить свой response. `MMA_SERVER_ERROR` означает ошибку доставки (например, неизвестный ID, заполненная очередь на 256 сообщений или частично принятая рассылка). Это не гарантия доставки и не признак безопасного повтора.
+
+`mma_server_handle_change_config` публикует проверенную новую конфигурацию. Активные соединения получают новую конфигурацию frame и `request_timeout`. Адрес/порт bind, `max_batch`, `max_connections`, `max_in_flight` и `shutdown_grace` динамически не меняются. TLS-настройки нельзя менять во время работы сервера. Обе функции handle можно вызывать из потоков приложения, пока сам handle остаётся действительным.
+
+### 8.7. Функции и коды возврата
+
+| Функция | Назначение |
+|---|---|
+| `mma_server_config_default`, `mma_server_create` | инициализация конфигурации и создание сервера |
+| `mma_server_register_route` | регистрация Once route |
+| `mma_server_register_channel_handler` | регистрация channel route |
+| `mma_server_register_on_channel_connect_handler`, `...disconnect_handler` | регистрация lifecycle hooks |
+| `mma_server_start`, `mma_server_local_port`, `mma_server_stop`, `mma_server_destroy` | жизненный цикл сервера и получение порта |
+| `mma_request_retain`, `mma_request_release` | время жизни запроса после возврата callback |
+| `mma_request_get_info`, `mma_request_option_count`, `mma_request_option_at`, `mma_request_is_cancelled` | чтение запроса и состояния отмены |
+| `mma_request_complete` | завершение route-запроса с response |
+| `mma_response_new`, `mma_response_set_status`, `mma_response_set_payload`, `mma_response_add_option`, `mma_response_destroy` | создание, заполнение и освобождение response |
+| `mma_server_get_handle`, `mma_server_handle_destroy` | получение/освобождение клонируемого server handle |
+| `mma_server_handle_send_to_channel`, `mma_server_handle_change_config` | push в канал и изменение конфигурации |
+
+| Код | Имя | Значение |
+|---:|---|---|
+| 0 | `MMA_OK` | успех |
+| −1 | `MMA_INVALID_ARGUMENT` | нулевой указатель или некорректный аргумент |
+| −2 | `MMA_INVALID_CONFIG` | некорректная конфигурация |
+| −3 | `MMA_SERVER_ERROR` | ошибка запуска/runtime/операции |
+| −4 | `MMA_SERVER_ALREADY_STARTED` | сервер уже запущен |
+| −5 | `MMA_REQUEST_ALREADY_COMPLETED` | route-запрос уже завершён (response потреблён) |
+| −6 | `MMA_REQUEST_CANCELLED` | route-запрос отменён (response потреблён) |
+
+Opcode ответов: `MMA_RESPONSE_OK`, `MMA_RESPONSE_BAD_REQUEST`, `MMA_RESPONSE_UNAUTHORIZED`, `MMA_RESPONSE_FORBIDDEN`, `MMA_RESPONSE_NOT_FOUND`, `MMA_RESPONSE_CONFLICT`, `MMA_RESPONSE_INTERNAL_ERROR`, `MMA_RESPONSE_CHANNEL_MESSAGE`, `MMA_RESPONSE_SHUTDOWN`, `MMA_RESPONSE_CHANNEL_CONNECTED` и `MMA_RESPONSE_TIMEOUT` (значения 1–11).
+
+### 8.8. Конфигурация, строки и время жизни
+
+`MMA_ServerConfig` содержит `const MMA_TLSConfig *tls_config`; `NULL` отключает TLS. Все поля timeout (`drain_timeout_ms`, `shutdown_grace_ms`, `request_timeout_ms` и `tls_handshake_timeout`) задаются в миллисекундах. При текущей раскладке `repr(C)` размер `MMA_ServerConfig` на x86-64 — 72 байта, `MMA_TLSConfig` — 24 байта. Всегда компилируйте C-код с `mma.h`, поставляемым с той native-библиотекой, с которой выполняется линковка.
+
+Библиотека копирует `bind_ip`, пути к сертификату/ключу, имена зарегистрированных route, payload и буферы options во время соответствующего вызова API. Конфигурация и вложенная `MMA_TLSConfig` должны оставаться действительными на время `mma_server_create` или `mma_server_handle_change_config`; строки можно освободить после возврата вызова. `user_data` не копируется: храните его до остановки сервера и окончания callback-ов. Буферы для `mma_response_set_payload` и `mma_response_add_option` можно освобождать после возврата вызова.
+
+- В POSIX C-хосте игнорируйте `SIGPIPE` до запуска сервера (`signal(SIGPIPE, SIG_IGN)`). Примеры демонстрируют обработку сигналов остановки. В Windows консольные события обрабатываются через Windows Console API.
+- Пока используете `MMA_ServerHandle`, он должен оставаться действительным; уничтожайте его до уничтожения сервера. `mma_server_handle_destroy` не останавливает сервер.
+- Не вызывайте `mma_server_stop` или `mma_server_destroy` из callback этого же сервера: `stop` ожидает завершения runtime-потока.
+- Текущий C ABI несовместим с C-заголовком до async-переработки из предыдущего release snapshot. Перекомпилируйте приложение с новым заголовком и связывайте с соответствующей библиотекой; см. [§9](#9-совместимость-и-версионирование).
+
+Полные реализации находятся в [`examples/example_no_tls.c`](examples/example_no_tls.c) и [`examples/example_with_tls.c`](examples/example_with_tls.c). В них показаны route `POW`, `ECHO`, `CHANGE`, channel-handler `SEND`, lifecycle callbacks, владение response, работа с server handle и корректное завершение сервера.
 
 ---
 
@@ -788,7 +874,7 @@ Wire-раскладка задаётся через `config.framer` (`MMA_Framer
 |---|---|---|
 | Wire-протокол | `MMA_VERSION = 1` | повышается при несовместимых изменениях кадра или семантики |
 | Rust crate | `0.1.0` в `Cargo.toml` (git-теги доходят до `v0.1.4`) | до 1.0 breaking-изменения возможны в любом релизе; изменились пути модулей и API push (см. [CHANGELOG.ru.md](CHANGELOG.ru.md)) |
-| C ABI / `mma.h` | без версии | `MMA_ServerConfig` содержит поле `const MMA_TLSConfig *tls_config`; размер Rust-структуры `repr(C)` на x86-64 — 72 байта. Пересоберите C-код с соответствующим заголовком; `mma_server_handle_send_to_channel` не ждёт; запроса версии в рантайме нет |
+| C ABI / `mma.h` | без версии | Breaking change относительно предыдущего release snapshot: `MMA_Request` и `MMA_Response` стали непрозрачными handle; сигнатуры callback изменены на `void`, а route-response завершается через `mma_request_complete`. Пересоберите все C-приложения с актуальным `mma.h`; запроса ABI-версии в рантайме нет |
 
 Два участника совместимы по wire, только если совпадают `MMA_VERSION` **и** весь `FramerConfig`. Замечание: правило зарезервированного route для `ChannelConnect` ([§5.5](#55-зарезервированные-маршруты-и-хуки-жизненного-цикла-соединения)) меняет семантику запроса, не меняя раскладку кадра и `MMA_VERSION`; см. [CHANGELOG.ru.md](CHANGELOG.ru.md). Новые opcode или обязательное поле требуют новой `MMA_VERSION`; старый сервер закрывает соединение при неизвестном opcode запроса.
 
@@ -808,7 +894,7 @@ Wire-раскладка задаётся через `config.framer` (`MMA_Framer
 | Соединения | `max_connections` |
 | Запросы в полёте | `max_in_flight` глобально; лимита на соединение нет |
 | Очередь push-сообщений | 256 сообщений на channel-соединение |
-| Время обработчика | `request_timeout` (только async-код) |
+| Время обработчика | `request_timeout` для async-обработки; выполняющийся синхронный C-callback нельзя прервать |
 
 Пока не покрыто: idle/read/write-таймауты (атаки медленными клиентами), глобальный лимит байт в полёте и защита от клиентов, не читающих ответы (они же останавливают `send_to_channel(0, ..)`, см. [§5.4](#54-режим-channel)).
 
@@ -823,11 +909,12 @@ Wire-раскладка задаётся через `config.framer` (`MMA_Framer
 | `src/network/network.rs` | цикл соединения, машина состояний (приватный) |
 | `src/config/config.rs` | `Config`, `FramerConfig`, `BigBytesConfig`, `MMA_VERSION` |
 | `src/core/` | `commands` (Request/Response, `SocketStatus`), `router` (маршруты, обработчики, хуки жизненного цикла), `server`, `handle` (`ServerHandle`), `channel_hub` и `tls` (приватные) |
-| `src/c_api.rs` | экспорты C ABI |
+| `src/c_api.rs` | экспорты C ABI (непрозрачные handle, refcount запросов и асинхронное завершение route) |
 | `include/mma.h` | C-заголовок |
+| `.gitattributes` | нормализует окончания строк текстовых файлов к LF между операционными системами |
 | `examples/example_no_tls.rs`, `examples/example_with_tls.rs` | примеры сервера на Rust без TLS и с TLS; оба показывают обработчики маршрутов и каналов, а также хуки жизненного цикла соединения |
 | `examples/example_no_tls.c`, `examples/example_with_tls.c` | примеры сервера через C ABI без TLS и с TLS; TLS-пример принимает пути к сертификату и приватному ключу |
 | `mma_gui_client.py` | тестовый клиент на Tkinter (стандартная библиотека Python): настраиваемая раскладка, все три opcode, самотест кодека |
-| `.github/workflows/native-release.yml` | CI при push, pull request и ручном запуске: тесты Rust, сборка release-библиотеки и примеров, компиляция обоих C-примеров с `-Werror`, проверка заголовка из C++. На тегах `v*` собирает четыре native-пакета (Windows x86-64, Linux x86-64, macOS x86-64 и macOS arm64), проверяет SHA-256 и публикует GitHub Release |
+| `.github/workflows/native-release.yml` | CI при push, pull request и ручном запуске: тесты Rust, сборка release-библиотеки и примеров, компиляция обоих C-примеров на Linux (Clang) и Windows (MSVC), проверка публичного заголовка из C++. На тегах `v*` собирает четыре native-пакета (Windows x86-64, Linux x86-64, macOS x86-64 и macOS arm64), проверяет SHA-256 и публикует GitHub Release |
 | `CHANGELOG.md`, `CHANGELOG.ru.md` | история изменений на английском и русском с влиянием на wire / Rust API / C ABI |
 | `tests/` | тесты конфигурации (тесты кодека сейчас отключены) |
