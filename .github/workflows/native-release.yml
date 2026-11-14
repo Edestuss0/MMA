@@ -1,3 +1,4 @@
+
 name: CI and native release
 
 on:
@@ -91,6 +92,7 @@ jobs:
               MMA_ServerHandle *handle = nullptr;
               MMA_Request *request = nullptr;
               MMA_Response *response = nullptr;
+
               (void)config;
               (void)tls;
               (void)info;
@@ -98,6 +100,7 @@ jobs:
               (void)handle;
               (void)request;
               (void)response;
+
               return MMA_OK;
           }
           CPP
@@ -136,26 +139,45 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+
           $importLibrary = 'target/release/MMA.dll.lib'
+
           if (!(Test-Path -LiteralPath $importLibrary -PathType Leaf)) {
               throw "MSVC import library was not produced: $importLibrary"
           }
 
           New-Item -ItemType Directory -Force -Path target | Out-Null
+
           foreach ($source in @(
               'examples/example_no_tls.c',
               'examples/example_with_tls.c'
           )) {
               $name = [System.IO.Path]::GetFileNameWithoutExtension($source)
               $output = "target/$name.exe"
+
               Write-Host "Compiling $source..."
-              & cl.exe /nologo /std:c11 /W4 /WX /TC /I include $source $importLibrary "/Fe:$output"
+
+              & cl.exe `
+                  /nologo `
+                  /std:c11 `
+                  /W4 `
+                  /WX `
+                  /TC `
+                  /I include `
+                  $source `
+                  "/Fe:$output" `
+                  /link `
+                  $importLibrary
+
               if ($LASTEXITCODE -ne 0) {
                   exit $LASTEXITCODE
               }
+
               if (!(Test-Path -LiteralPath $output -PathType Leaf)) {
                   throw "MSVC did not produce $output"
               }
+
+              Write-Host "Successfully compiled $output"
           }
 
   build-native:
@@ -239,15 +261,19 @@ jobs:
           if (!(Test-Path -LiteralPath $library -PathType Leaf)) {
               throw "Native library was not produced: $library"
           }
+
           if (!(Test-Path -LiteralPath $importLibrary -PathType Leaf)) {
               throw "MSVC import library was not produced: $importLibrary"
           }
 
           New-Item -ItemType Directory -Force -Path dist | Out-Null
+
           $stage = Join-Path $env:RUNNER_TEMP 'mma-native-package'
+
           if (Test-Path -LiteralPath $stage) {
               Remove-Item -LiteralPath $stage -Recurse -Force
           }
+
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
           Copy-Item -LiteralPath $library -Destination $stage
@@ -255,12 +281,21 @@ jobs:
           Copy-Item -LiteralPath 'include/mma.h' -Destination $stage
 
           $archive = Join-Path $PWD 'dist/${{ matrix.asset }}'
-          Compress-Archive -Path (Join-Path $stage '*') `
-              -DestinationPath $archive -CompressionLevel Optimal -Force
 
-          $digest = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          Compress-Archive `
+              -Path (Join-Path $stage '*') `
+              -DestinationPath $archive `
+              -CompressionLevel Optimal `
+              -Force
+
+          $digest = (
+              Get-FileHash -LiteralPath $archive -Algorithm SHA256
+          ).Hash.ToLowerInvariant()
+
           $assetName = [System.IO.Path]::GetFileName($archive)
-          "$digest  $assetName" | Set-Content -LiteralPath "$archive.sha256" -Encoding ascii
+
+          "$digest  $assetName" |
+              Set-Content -LiteralPath "$archive.sha256" -Encoding ascii
 
           Write-Host "Created $archive"
 
@@ -269,7 +304,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           library="target/${{ matrix.target }}/release/${{ matrix.library }}"
+
           install_name_tool -id '@rpath/libMMA.dylib' "$library"
           otool -D "$library"
 
@@ -288,7 +325,9 @@ jobs:
           fi
 
           mkdir -p dist
+
           archive="dist/${{ matrix.asset }}"
+
           zip -j "$archive" "$library" include/mma.h
 
           (
@@ -313,6 +352,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build-native
     runs-on: ubuntu-24.04
+
     permissions:
       contents: write
 
@@ -344,12 +384,16 @@ jobs:
               echo "Missing or empty release asset: $archive" >&2
               exit 1
             }
+
             test -s "$checksum" || {
               echo "Missing checksum file: $checksum" >&2
               exit 1
             }
 
-            (cd dist && sha256sum --check "$asset.sha256")
+            (
+              cd dist
+              sha256sum --check "$asset.sha256"
+            )
           done
 
           echo 'All native packages passed SHA-256 verification.'
