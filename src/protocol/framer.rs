@@ -409,8 +409,8 @@ fn decode_headers(bytes: &[u8], config: &FramerConfig) -> Result<RequestHeaders,
         });
     }
 
-    let big_bytes: &[u8; 12] =
-        (&bytes[bytes.len() - 12..])
+    let big_bytes: &[u8; RESERVED_SUFFIX as usize] =
+        (&bytes[bytes.len() - RESERVED_SUFFIX as usize..])
             .try_into()
             .map_err(|_| ProtocolError::InvalidFrame {
                 message: "Invalid big bytes trail",
