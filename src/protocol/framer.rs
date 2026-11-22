@@ -409,13 +409,13 @@ fn decode_headers(bytes: &[u8], config: &FramerConfig) -> Result<RequestHeaders,
         });
     }
 
-    let big_bytes: &[u8; RESERVED_SUFFIX as usize] =
-        (&bytes[bytes.len() - RESERVED_SUFFIX as usize..])
-            .try_into()
-            .map_err(|_| ProtocolError::InvalidFrame {
-                message: "Invalid big bytes trail",
-                req_id: None,
-            })?;
+    let big_bytes: &[u8; RESERVED_SUFFIX as usize] = (&bytes
+        [bytes.len() - RESERVED_SUFFIX as usize..])
+        .try_into()
+        .map_err(|_| ProtocolError::InvalidFrame {
+            message: "Invalid big bytes trail",
+            req_id: None,
+        })?;
 
     let (payload_len, options_len, req_id) = decode_big_bytes(big_bytes, &config.big_bytes_config)
         .map_err(|_| ProtocolError::InvalidFrame {

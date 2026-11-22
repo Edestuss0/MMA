@@ -7,7 +7,7 @@ use bytes::Bytes;
 use std::io;
 use thiserror::Error;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Request {
     pub headers: RequestHeaders,
     pub payload: Bytes,
@@ -24,7 +24,7 @@ impl Request {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RequestHeaders {
     pub opcode: RequestOpcode,
     pub version: u8,

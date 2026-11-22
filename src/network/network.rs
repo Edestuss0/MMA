@@ -329,7 +329,7 @@ where
                         .await
                         .is_err()
                     {
-                        if change_socket_status(SocketStatus::Fresh, status, socket_status,)
+                        if change_socket_status(SocketStatus::Fresh, status, socket_status)
                             .await
                             .is_err()
                         {
@@ -342,7 +342,7 @@ where
                         return Some(Response::internal_error(req_id));
                     }
 
-                    if change_socket_status(SocketStatus::Fresh, status, socket_status,)
+                    if change_socket_status(SocketStatus::Fresh, status, socket_status)
                         .await
                         .is_err()
                     {
@@ -370,70 +370,66 @@ where
                 ));
             }
         },
-        SocketStatus::Once => {
-            match cmd.headers.opcode {
-                RequestOpcode::Once => {
-                    let response = match AssertUnwindSafe(router.handle(cmd)).catch_unwind().await {
-                        Ok(response) => response,
-                        Err(_) => Response::internal_error(req_id),
-                    };
+        SocketStatus::Once => match cmd.headers.opcode {
+            RequestOpcode::Once => {
+                let response = match AssertUnwindSafe(router.handle(cmd)).catch_unwind().await {
+                    Ok(response) => response,
+                    Err(_) => Response::internal_error(req_id),
+                };
 
-                    drop(permit);
+                drop(permit);
 
-                    return Some(response);
-                }
-                _ => {
-                    drop(permit);
-                    return Some(Response::connection_type_mismatch(req_id));
-                }
+                return Some(response);
             }
-        }
-        SocketStatus::Channel(conn_id) => {
-            match cmd.headers.opcode {
-                RequestOpcode::ChannelConnect => {
-                    drop(permit);
-                    return Some(Response::conflict(
-                        req_id,
-                        Bytes::from("Channel already connected"),
-                    ));
-                }
-                RequestOpcode::ChannelMessage => {
-                    if cmd.route.to_uppercase()
-                        == ReservedRoutes::CHANNEL_DISCONNECT
-                            .to_string()
-                            .to_uppercase()
-                    {
-                        if AssertUnwindSafe(router.on_channel_disconnect(cmd.clone(), conn_id))
-                            .catch_unwind()
-                            .await
-                            .is_err()
-                        {
-                            return Some(Response::internal_error(req_id));
-                        };
-                        on_channel_disconnect();
-                        return None;
-                    }
-                    match AssertUnwindSafe(router.handle_channel(cmd, &conn_id))
+            _ => {
+                drop(permit);
+                return Some(Response::connection_type_mismatch(req_id));
+            }
+        },
+        SocketStatus::Channel(conn_id) => match cmd.headers.opcode {
+            RequestOpcode::ChannelConnect => {
+                drop(permit);
+                return Some(Response::conflict(
+                    req_id,
+                    Bytes::from("Channel already connected"),
+                ));
+            }
+            RequestOpcode::ChannelMessage => {
+                if cmd.route.to_uppercase()
+                    == ReservedRoutes::CHANNEL_DISCONNECT
+                        .to_string()
+                        .to_uppercase()
+                {
+                    if AssertUnwindSafe(router.on_channel_disconnect(cmd.clone(), conn_id))
                         .catch_unwind()
                         .await
+                        .is_err()
                     {
-                        Result::Ok(Result::Err(r)) => {
-                            drop(permit);
-                            return Some(r);
-                        }
-                        Err(_) => {
-                            drop(permit);
-                            return Some(Response::internal_error(req_id));
-                        }
-                        _ => {}
-                    }
+                        return Some(Response::internal_error(req_id));
+                    };
+                    on_channel_disconnect();
+                    return None;
                 }
-                RequestOpcode::Once => {
-                    drop(permit);
-                    return Some(Response::connection_type_mismatch(req_id));
+                match AssertUnwindSafe(router.handle_channel(cmd, &conn_id))
+                    .catch_unwind()
+                    .await
+                {
+                    Result::Ok(Result::Err(r)) => {
+                        drop(permit);
+                        return Some(r);
+                    }
+                    Err(_) => {
+                        drop(permit);
+                        return Some(Response::internal_error(req_id));
+                    }
+                    _ => {}
                 }
             }
-        }
+            RequestOpcode::Once => {
+                drop(permit);
+                return Some(Response::connection_type_mismatch(req_id));
+            }
+        },
     };
 
     None
@@ -552,8 +548,16 @@ async fn change_socket_status(
     new: SocketStatus,
     status: Arc<AtomicU64>,
 ) -> Result<(), ()> {
-    if status.compare_exchange(SocketStatus::to_u64(old), SocketStatus::to_u64(new), Ordering::Relaxed,  Ordering::Relaxed).is_err() {
-        return Err(())
+    if status
+        .compare_exchange(
+            SocketStatus::to_u64(old),
+            SocketStatus::to_u64(new),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        return Err(());
     };
     Ok(())
 }
