@@ -18,6 +18,7 @@ use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::sync::mpsc;
@@ -52,7 +53,14 @@ pub async fn serve_connection<S, F, T>(
 
     let framer_config = Arc::new(RwLock::new(config.frame_config.clone()));
 
-    let framed = Framed::new(socket, Framer::new(Arc::clone(&framer_config)));
+    let framer = match Framer::new(Arc::clone(&framer_config)) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Cannot create framer: {e}");
+            return;
+        }
+    };
+    let framed = Framed::new(socket, framer);
 
     let (sink, mut stream) = framed.split();
     let (tx, rx) = tokio::sync::mpsc::channel::<Response>(1000);
@@ -64,7 +72,7 @@ pub async fn serve_connection<S, F, T>(
     let socket_status = Arc::new(AtomicU64::new(SocketStatus::to_u64(SocketStatus::Fresh)));
     let channel_task: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
 
-    let mut writer = writer(sink, rx, config.max_batch);
+    let mut writer = writer(sink, rx, config.max_batch, config.write_timeout);
     let on_channel_disconnect = Arc::new(on_channel_disconnect);
     let disconnect = CancellationToken::new();
     let channel_connection_semaphore = Arc::new(Semaphore::new(1));
@@ -336,9 +344,7 @@ where
                 return Some(response);
             }
             RequestOpcode::ChannelConnect => {
-                if cmd.route.to_uppercase()
-                    == ReservedRoutes::CHANNEL_CONNECT.to_string().to_uppercase()
-                {
+                if cmd.route == ReservedRoutes::CHANNEL_CONNECT.as_bytes() {
                     let conn_id = match on_channel_connect() {
                         Ok(s) => s,
                         Err(e) => {
@@ -402,11 +408,7 @@ where
                 ));
             }
             RequestOpcode::ChannelMessage => {
-                if cmd.route.to_uppercase()
-                    == ReservedRoutes::CHANNEL_DISCONNECT
-                        .to_string()
-                        .to_uppercase()
-                {
+                if cmd.route == ReservedRoutes::CHANNEL_DISCONNECT.as_bytes() {
                     if AssertUnwindSafe(router.on_channel_disconnect(cmd.clone(), conn_id))
                         .catch_unwind()
                         .await
@@ -446,6 +448,7 @@ fn writer<S>(
     mut sink: SplitSink<Framed<S, Framer>, Response>,
     mut rx: Receiver<Response>,
     max_batch: u32,
+    timeout: Duration,
 ) -> tokio::task::JoinHandle<()>
 where
     S: AsyncConnection,
@@ -541,9 +544,14 @@ where
                     Err(_) => break,
                 }
             }
-            if let Err(e) = sink.flush().await {
-                eprintln!("Error flushing sink: {e}");
-                return;
+            match tokio::time::timeout(timeout, sink.flush()).await {
+                Err(_) => return,
+                Ok(r) => {
+                    if let Err(e) = r {
+                        eprintln!("Error flushing sink: {e}");
+                        return;
+                    }
+                }
             }
         }
         let _ = sink.close().await;

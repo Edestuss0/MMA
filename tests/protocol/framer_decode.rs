@@ -32,7 +32,7 @@ fn encode_big_bytes(
 #[test]
 fn decode_simple_request_with_default_config() {
     let config = FramerConfig::default();
-    let mut framer = Framer::new(Arc::new(RwLock::new(config.clone())));
+    let mut framer = Framer::new(Arc::new(RwLock::new(config.clone()))).unwrap();
 
     let options = vec![
         (Bytes::from("key1"), Bytes::from("value1")),
@@ -44,7 +44,7 @@ fn decode_simple_request_with_default_config() {
         .map(|(key, value)| key.len() + value.len() + 4)
         .sum();
     let payload = Bytes::from("Test payload");
-    let route = String::from("ROUTE");
+    let route = Bytes::from("ROUTE");
     let header = RequestHeaders {
         opcode: RequestOpcode::Once,
         options_count: options.len() as u8,
@@ -96,7 +96,7 @@ fn decode_simple_request_with_default_config() {
 
             bytes.put_slice(&options_bytes);
         } else if config.route_order == i {
-            bytes.put_slice(route.as_bytes());
+            bytes.put_slice(&route);
         } else if config.payload_order == i {
             bytes.put_slice(&payload);
         }
@@ -115,7 +115,7 @@ fn decode_simple_request_with_another_header_config() {
     config.options_count_pos = 13;
     config.version_pos = 7;
     config.route_len_pos = 14;
-    let mut framer = Framer::new(Arc::new(RwLock::new(config.clone())));
+    let mut framer = Framer::new(Arc::new(RwLock::new(config.clone()))).unwrap();
 
     let options = vec![
         (Bytes::from("key1"), Bytes::from("value1")),
@@ -127,7 +127,7 @@ fn decode_simple_request_with_another_header_config() {
         .map(|(key, value)| key.len() + value.len() + 4)
         .sum();
     let payload = Bytes::from("Test payload");
-    let route = String::from("ROUTE");
+    let route = Bytes::from("ROUTE");
     let header = RequestHeaders {
         opcode: RequestOpcode::Once,
         options_count: options.len() as u8,
@@ -179,7 +179,7 @@ fn decode_simple_request_with_another_header_config() {
 
             bytes.put_slice(&options_bytes);
         } else if config.route_order == i {
-            bytes.put_slice(route.as_bytes());
+            bytes.put_slice(&route);
         } else if config.payload_order == i {
             bytes.put_slice(&payload);
         }
@@ -201,7 +201,7 @@ fn decode_simple_request_with_another_header_config_and_another_POR() {
     config.payload_order = 1;
     config.route_order = 2;
     config.options_order = 3;
-    let mut framer = Framer::new(Arc::new(RwLock::new(config.clone())));
+    let mut framer = Framer::new(Arc::new(RwLock::new(config.clone()))).unwrap();
 
     let options = vec![
         (Bytes::from("key1"), Bytes::from("value1")),
@@ -213,7 +213,7 @@ fn decode_simple_request_with_another_header_config_and_another_POR() {
         .map(|(key, value)| key.len() + value.len() + 4)
         .sum();
     let payload = Bytes::from("Test payload");
-    let route = String::from("ROUTE");
+    let route = Bytes::from("ROUTE");
     let header = RequestHeaders {
         opcode: RequestOpcode::Once,
         options_count: options.len() as u8,
@@ -265,7 +265,7 @@ fn decode_simple_request_with_another_header_config_and_another_POR() {
 
             bytes.put_slice(&options_bytes);
         } else if config.route_order == i {
-            bytes.put_slice(route.as_bytes());
+            bytes.put_slice(&route);
         } else if config.payload_order == i {
             bytes.put_slice(&payload);
         }
@@ -290,7 +290,7 @@ fn decode_simple_request_with_another_header_config_and_another_POR_and_another_
     config.big_bytes_config.req_id_order = 1;
     config.big_bytes_config.options_len_order = 3;
     config.big_bytes_config.payload_len_order = 2;
-    let mut framer = Framer::new(Arc::new(RwLock::new(config.clone())));
+    let mut framer = Framer::new(Arc::new(RwLock::new(config.clone()))).unwrap();
 
     let options = vec![
         (Bytes::from("key1"), Bytes::from("value1")),
@@ -302,7 +302,7 @@ fn decode_simple_request_with_another_header_config_and_another_POR_and_another_
         .map(|(key, value)| key.len() + value.len() + 4)
         .sum();
     let payload = Bytes::from("Test payload");
-    let route = String::from("ROUTE");
+    let route = Bytes::from("ROUTE");
     let header = RequestHeaders {
         opcode: RequestOpcode::Once,
         options_count: options.len() as u8,
@@ -354,7 +354,7 @@ fn decode_simple_request_with_another_header_config_and_another_POR_and_another_
 
             bytes.put_slice(&options_bytes);
         } else if config.route_order == i {
-            bytes.put_slice(route.as_bytes());
+            bytes.put_slice(&route);
         } else if config.payload_order == i {
             bytes.put_slice(&payload);
         }
@@ -369,7 +369,7 @@ fn decode_simple_request_with_another_header_config_and_another_POR_and_another_
 fn decode_big_request_with_default_config() {
     let mut rng = rand::rng();
     let config = FramerConfig::default();
-    let mut framer = Framer::new(Arc::new(RwLock::new(config.clone())));
+    let mut framer = Framer::new(Arc::new(RwLock::new(config.clone()))).unwrap();
 
     let opts_count = rng.random_range((u8::MIN)..=(u8::MAX));
     let mut options = Vec::with_capacity(opts_count as usize);
@@ -381,7 +381,7 @@ fn decode_big_request_with_default_config() {
         options.push((Bytes::from(key), Bytes::from(value)));
     }
 
-    let route = String::from("ROUTE");
+    let route = Bytes::from("ROUTE");
     let opts_len: usize = options
         .clone()
         .iter()
@@ -445,7 +445,7 @@ fn decode_big_request_with_default_config() {
 
             bytes.put_slice(&options_bytes);
         } else if config.route_order == i {
-            bytes.put_slice(route.as_bytes());
+            bytes.put_slice(&route);
         } else if config.payload_order == i {
             bytes.put_slice(&(payload.clone().freeze()));
         }
@@ -464,7 +464,7 @@ fn decode_big_request_with_another_header_config() {
     config.options_count_pos = 13;
     config.version_pos = 7;
     config.route_len_pos = 14;
-    let mut framer = Framer::new(Arc::new(RwLock::new(config.clone())));
+    let mut framer = Framer::new(Arc::new(RwLock::new(config.clone()))).unwrap();
 
     let mut rng = rand::rng();
     let opts_count = rng.random_range((u8::MIN)..=(u8::MAX));
@@ -477,7 +477,7 @@ fn decode_big_request_with_another_header_config() {
         options.push((Bytes::from(key), Bytes::from(value)));
     }
 
-    let route = String::from("ROUTE");
+    let route = Bytes::from("ROUTE");
     let opts_len: usize = options
         .clone()
         .iter()
@@ -541,7 +541,7 @@ fn decode_big_request_with_another_header_config() {
 
             bytes.put_slice(&options_bytes);
         } else if config.route_order == i {
-            bytes.put_slice(route.as_bytes());
+            bytes.put_slice(&route);
         } else if config.payload_order == i {
             bytes.put_slice(&payload);
         }
@@ -563,7 +563,7 @@ fn decode_big_request_with_another_header_config_and_another_POR() {
     config.payload_order = 1;
     config.route_order = 2;
     config.options_order = 3;
-    let mut framer = Framer::new(Arc::new(RwLock::new(config.clone())));
+    let mut framer = Framer::new(Arc::new(RwLock::new(config.clone()))).unwrap();
 
     let mut rng = rand::rng();
     let opts_count = rng.random_range((u8::MIN)..=(u8::MAX));
@@ -576,7 +576,8 @@ fn decode_big_request_with_another_header_config_and_another_POR() {
         options.push((Bytes::from(key), Bytes::from(value)));
     }
 
-    let route = String::from("ROUTE");
+    let route = Bytes::from("ROUTE");
+
     let opts_len: usize = options
         .clone()
         .iter()
@@ -639,7 +640,7 @@ fn decode_big_request_with_another_header_config_and_another_POR() {
 
             bytes.put_slice(&options_bytes);
         } else if config.route_order == i {
-            bytes.put_slice(route.as_bytes());
+            bytes.put_slice(&route);
         } else if config.payload_order == i {
             bytes.put_slice(&payload);
         }
@@ -664,7 +665,7 @@ fn decode_big_request_with_another_header_config_and_another_POR_and_another_big
     config.big_bytes_config.req_id_order = 1;
     config.big_bytes_config.options_len_order = 3;
     config.big_bytes_config.payload_len_order = 2;
-    let mut framer = Framer::new(Arc::new(RwLock::new(config.clone())));
+    let mut framer = Framer::new(Arc::new(RwLock::new(config.clone()))).unwrap();
 
     let mut rng = rand::rng();
     let opts_count = rng.random_range((u8::MIN)..=(u8::MAX));
@@ -677,7 +678,7 @@ fn decode_big_request_with_another_header_config_and_another_POR_and_another_big
         options.push((Bytes::from(key), Bytes::from(value)));
     }
 
-    let route = String::from("ROUTE");
+    let route = Bytes::from("ROUTE");
     let opts_len: usize = options
         .clone()
         .iter()
@@ -740,7 +741,7 @@ fn decode_big_request_with_another_header_config_and_another_POR_and_another_big
 
             bytes.put_slice(&options_bytes);
         } else if config.route_order == i {
-            bytes.put_slice(route.as_bytes());
+            bytes.put_slice(&route);
         } else if config.payload_order == i {
             bytes.put_slice(&payload);
         }

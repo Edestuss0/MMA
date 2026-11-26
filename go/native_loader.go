@@ -16,7 +16,7 @@ import (
 	"unicode/utf8"
 )
 
-const nativeRepository = "https://github.com/Edestuss0/MMA-Network-protocol"
+const nativeRepository = "https://github.com/Edestuss0/MMA"
 
 var nativeHTTPClient = &http.Client{Timeout: 2 * time.Minute}
 

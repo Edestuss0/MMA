@@ -42,6 +42,8 @@ func serverConfigFromNative(native nativeServerConfig) ServerConfig {
 		DrainTimeout:   time.Duration(native.drainTimeoutMS) * time.Millisecond,
 		ShutdownGrace:  time.Duration(native.shutdownGraceMS) * time.Millisecond,
 		RequestTimeout: time.Duration(native.requestTimeoutMS) * time.Millisecond,
+		WriteTimeout:   time.Duration(native.writeTimeoutMS) * time.Millisecond,
+		SocketBackoff:  time.Duration(native.socketBackoffUS) * time.Microsecond,
 	}
 }
 
@@ -93,7 +95,7 @@ func buildNativeConfig(
 		return nativeServerConfig{}, nil, nil, nil, nil,
 			fmt.Errorf("%w: BindIP must be non-empty and cannot contain NUL", ErrInvalidArgument)
 	}
-	if config.DrainTimeout < 0 || config.ShutdownGrace < 0 || config.RequestTimeout < 0 {
+	if config.DrainTimeout < 0 || config.ShutdownGrace < 0 || config.RequestTimeout < 0 || config.WriteTimeout < 0 || config.SocketBackoff < 0 {
 		return nativeServerConfig{}, nil, nil, nil, nil,
 			fmt.Errorf("%w: server timeouts must not be negative", ErrInvalidConfig)
 	}
@@ -109,6 +111,8 @@ func buildNativeConfig(
 		drainTimeoutMS:   uint64(config.DrainTimeout / time.Millisecond),
 		shutdownGraceMS:  uint64(config.ShutdownGrace / time.Millisecond),
 		requestTimeoutMS: uint64(config.RequestTimeout / time.Millisecond),
+		writeTimeoutMS:   uint64(config.WriteTimeout / time.Millisecond),
+		socketBackoffUS:  uint64(config.SocketBackoff / time.Microsecond),
 		tlsConfig:        nil,
 	}
 

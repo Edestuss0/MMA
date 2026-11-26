@@ -96,6 +96,8 @@ pub struct MMA_ServerConfig {
     pub drain_timeout_ms: u64,
     pub shutdown_grace_ms: u64,
     pub request_timeout_ms: u64,
+    pub write_timeout_ms: u64,
+    pub socket_backoff_us: u64,
 
     pub tls_config: *const MMA_TLSConfig,
 }
@@ -384,21 +386,15 @@ fn config_from_c(config: &MMA_ServerConfig) -> Option<Config> {
 
     Some(Config {
         address: SocketAddr::new(ip_addr, config.port),
-
         frame_config: framer_config_from_c(config.framer)?,
-
         max_batch: config.max_batch,
-
         max_connections: config.max_connections,
-
         max_in_flight: config.max_in_flight,
-
         drain_timeout: Duration::from_millis(config.drain_timeout_ms),
-
         shutdown_grace: Duration::from_millis(config.shutdown_grace_ms),
-
         request_timeout: Duration::from_millis(config.request_timeout_ms),
-
+        write_timeout: Duration::from_millis(config.write_timeout_ms),
+        socket_backoff: Duration::from_micros(config.socket_backoff_us),
         tls_config,
     })
 }
@@ -586,20 +582,16 @@ pub unsafe extern "C" fn mma_server_config_default(output: *mut MMA_ServerConfig
 
     let config = MMA_ServerConfig {
         bind_ip: c"0.0.0.0".as_ptr(),
-
         port: 8080,
-
         max_batch: 16,
         max_in_flight: 1024,
-
         framer: framer_config_to_c(&framer),
-
         max_connections: 128_000,
-
         drain_timeout_ms: 2_000,
         shutdown_grace_ms: 10_000,
         request_timeout_ms: 10_000,
-
+        socket_backoff_us: 1_000,
+        write_timeout_ms: 10_000,
         tls_config: ptr::null(),
     };
 

@@ -5,6 +5,7 @@ use MMA::core::router::Router;
 use MMA::core::server::Server;
 use bytes::Bytes;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[tokio::main]
@@ -13,6 +14,12 @@ async fn main() {
     let key = std::env::args().nth(2).unwrap();
 
     println!("cert: {}, key: {}", cert, key);
+
+    let tls_config = Arc::new(TlsConfig {
+        tls_certificate_path: cert,
+        tls_key_path: key,
+        tls_handshake_timeout: Duration::from_secs(10),
+    });
 
     let config = Config {
         address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 8080),
@@ -36,14 +43,8 @@ async fn main() {
         max_batch: 65535,
         max_in_flight: 65535,
         max_connections: 128_000,
-        drain_timeout: Duration::from_secs(2),
-        shutdown_grace: Duration::from_secs(10),
-        request_timeout: Duration::from_secs(10),
-        tls_config: Some(TlsConfig {
-            tls_certificate_path: cert,
-            tls_key_path: key,
-            tls_handshake_timeout: Duration::from_secs(10),
-        }),
+        tls_config: Some((*tls_config).clone()),
+        ..Default::default()
     };
 
     let mut router = Router::new();
@@ -111,11 +112,11 @@ async fn main() {
     if router
         .register_route(String::from("CHANGE"), {
             let handle = handle.clone();
-
             move |req, res| {
                 let handle = handle.clone();
+                let tls_config = Arc::clone(&tls_config);
 
-                async move { change(req, res, handle).await }
+                async move { change(req, res, handle, (*tls_config).clone()).await }
             }
         })
         .is_err()
@@ -132,7 +133,7 @@ async fn echo(req: Request, mut res: Response) -> Response {
     res
 }
 
-async fn change(_req: Request, res: Response, handle: ServerHandle) -> Response {
+async fn change(_req: Request, res: Response, handle: ServerHandle, tls: TlsConfig) -> Response {
     let config = Config {
         address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 8080),
         frame_config: FramerConfig {
@@ -155,10 +156,8 @@ async fn change(_req: Request, res: Response, handle: ServerHandle) -> Response 
         max_batch: 65535,
         max_in_flight: 65535,
         max_connections: 128_000,
-        drain_timeout: Duration::from_secs(2),
-        shutdown_grace: Duration::from_secs(10),
-        request_timeout: Duration::from_secs(10),
-        tls_config: None,
+        tls_config: Some(tls),
+        ..Default::default()
     };
     let _ = handle.change_config(config);
     res

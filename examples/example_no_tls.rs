@@ -5,7 +5,6 @@ use MMA::core::router::Router;
 use MMA::core::server::Server;
 use bytes::Bytes;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::Duration;
 
 #[tokio::main]
 async fn main() {
@@ -31,10 +30,7 @@ async fn main() {
         max_batch: 65535,
         max_in_flight: 65535,
         max_connections: 128_000,
-        drain_timeout: Duration::from_secs(2),
-        shutdown_grace: Duration::from_secs(10),
-        request_timeout: Duration::from_secs(10),
-        tls_config: None,
+        ..Default::default()
     };
 
     let mut router = Router::new();
@@ -146,10 +142,7 @@ async fn change(_req: Request, res: Response, handle: ServerHandle) -> Response 
         max_batch: 65535,
         max_in_flight: 65535,
         max_connections: 128_000,
-        drain_timeout: Duration::from_secs(2),
-        shutdown_grace: Duration::from_secs(10),
-        request_timeout: Duration::from_secs(10),
-        tls_config: None,
+        ..Default::default()
     };
     let _ = handle.change_config(config);
     res

@@ -14,7 +14,7 @@ fn encoding_small_payload_without_options_default_config() {
 
     let mut response = Response::new(13);
     response.payload = Bytes::from("IHATETHISPROJECT");
-    let mut framer = Framer::new(Arc::new(RwLock::new(config.clone())));
+    let mut framer = Framer::new(Arc::new(RwLock::new(config.clone()))).unwrap();
     let mut dst = BytesMut::new();
     let res = framer.encode(response.clone(), &mut dst);
 
@@ -101,7 +101,7 @@ fn encoding_small_payload_with_options_default_config() {
     response
         .options
         .push((Bytes::from("specialization"), Bytes::from("doctor")));
-    let mut framer = Framer::new(Arc::new(RwLock::new(config.clone())));
+    let mut framer = Framer::new(Arc::new(RwLock::new(config.clone()))).unwrap();
     let mut dst = BytesMut::new();
     let res = framer.encode(response.clone(), &mut dst);
 
@@ -179,7 +179,7 @@ fn encoding_small_payload_without_options_another_big_bytes() {
 
     let mut response = Response::new(2712);
     response.payload = Bytes::from("KHAChatryan");
-    let mut framer = Framer::new(Arc::new(RwLock::new(config.clone())));
+    let mut framer = Framer::new(Arc::new(RwLock::new(config.clone()))).unwrap();
     let mut dst = BytesMut::new();
     let res = framer.encode(response.clone(), &mut dst);
 
@@ -269,7 +269,7 @@ fn encoding_small_payload_with_options_another_big_bytes() {
     response
         .options
         .push((Bytes::from("specialization"), Bytes::from("doctor")));
-    let mut framer = Framer::new(Arc::new(RwLock::new(config.clone())));
+    let mut framer = Framer::new(Arc::new(RwLock::new(config.clone()))).unwrap();
     let mut dst = BytesMut::new();
     let res = framer.encode(response.clone(), &mut dst);
 
@@ -350,7 +350,7 @@ fn encoding_small_payload_without_options_another_big_bytes_and_another_POR() {
 
     let mut response = Response::new(2712);
     response.payload = Bytes::from("KHAChatryan");
-    let mut framer = Framer::new(Arc::new(RwLock::new(config.clone())));
+    let mut framer = Framer::new(Arc::new(RwLock::new(config.clone()))).unwrap();
     let mut dst = BytesMut::new();
     let res = framer.encode(response.clone(), &mut dst);
 
@@ -443,7 +443,7 @@ fn encoding_small_payload_with_options_another_big_bytes_and_another_POR() {
     response
         .options
         .push((Bytes::from("specialization"), Bytes::from("doctor")));
-    let mut framer = Framer::new(Arc::new(RwLock::new(config.clone())));
+    let mut framer = Framer::new(Arc::new(RwLock::new(config.clone()))).unwrap();
     let mut dst = BytesMut::new();
     let res = framer.encode(response.clone(), &mut dst);
 

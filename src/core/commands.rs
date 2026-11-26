@@ -11,7 +11,7 @@ use thiserror::Error;
 pub struct Request {
     pub headers: RequestHeaders,
     pub payload: Bytes,
-    pub route: String,
+    pub route: Bytes,
     pub options: Vec<(Bytes, Bytes)>,
 }
 

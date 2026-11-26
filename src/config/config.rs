@@ -5,6 +5,8 @@ use std::{
 
 use crate::config::config::ConfigError::{MaxBatch, MaxConnections, MaxInFlight, Port};
 
+const MAX_SOCKET_BACKOFF: Duration = Duration::from_secs(1);
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub address: SocketAddr,
@@ -15,6 +17,8 @@ pub struct Config {
     pub drain_timeout: Duration,
     pub shutdown_grace: Duration,
     pub request_timeout: Duration,
+    pub write_timeout: Duration,
+    pub socket_backoff: Duration,
     pub tls_config: Option<TlsConfig>,
 }
 
@@ -37,6 +41,8 @@ pub enum ConfigError {
     Framer,
     #[error("invalid port")]
     Port,
+    #[error("invalid timeout value")]
+    Timeout,
 }
 
 impl Default for Config {
@@ -50,6 +56,8 @@ impl Default for Config {
             drain_timeout: Duration::from_secs(2),
             shutdown_grace: Duration::from_secs(10),
             request_timeout: Duration::from_secs(10),
+            write_timeout: Duration::from_secs(10),
+            socket_backoff: Duration::from_millis(1),
             tls_config: None,
         }
     }
@@ -75,6 +83,10 @@ impl Config {
 
         if self.frame_config.validate().is_err() {
             return Err(ConfigError::Framer);
+        }
+
+        if self.socket_backoff > MAX_SOCKET_BACKOFF {
+            return Err(ConfigError::Timeout);
         }
 
         Result::Ok(())

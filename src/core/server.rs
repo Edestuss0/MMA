@@ -132,7 +132,11 @@ impl Server {
                 () = stop.cancelled() => break,
                 acc = self.tcp_listener.accept() => match acc {
                     Result::Ok((socket, _)) => socket,
-                    Result::Err(e) => { result = Err(e); continue; }
+                    Result::Err(e) => {
+                        result = Err(e);
+                        tokio::time::sleep(self.config.socket_backoff);
+                        continue;
+                    }
                 },
             };
             let permit = if let Result::Ok(p) = conns_semaphore.try_acquire_owned() {

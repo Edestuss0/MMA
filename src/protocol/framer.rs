@@ -1,6 +1,6 @@
 use std::sync::{Arc, RwLock};
 
-use crate::config::config::{BigBytesConfig, FramerConfig, RESERVED_SUFFIX};
+use crate::config::config::{BigBytesConfig, ConfigError, FramerConfig, RESERVED_SUFFIX};
 pub(crate) use crate::core::commands::{
     ProtocolError, Request, RequestHeaders, RequestOpcode, Response, ResponseHeaders,
 };
@@ -15,13 +15,14 @@ pub struct Framer {
 }
 
 impl Framer {
-    pub fn new(cfg: Arc<RwLock<FramerConfig>>) -> Self {
+    pub fn new(cfg: Arc<RwLock<FramerConfig>>) -> Result<Self, ConfigError> {
         let config = cfg.read().expect("lock poisoned").clone();
-        Self {
+        config.validate().map_err(|_| ConfigError::Framer)?;
+        Ok(Self {
             config: cfg,
             cached_header: None,
             cached_config: Some(config),
-        }
+        })
     }
 }
 
@@ -183,7 +184,7 @@ impl Decoder for Framer {
         let _hdr = src.split_to(config.header_length as usize);
 
         let mut payload = Bytes::new();
-        let mut route = String::with_capacity(headers.payload_len as usize);
+        let mut route = Bytes::new();
         let mut options: Vec<(Bytes, Bytes)> = Vec::with_capacity(headers.options_count as usize);
 
         for i in 1..=3 {
@@ -191,13 +192,7 @@ impl Decoder for Framer {
                 let option_bytes = src.split_to(headers.options_len as usize);
                 options = decode_options(option_bytes, &config, &headers, Some(headers.req_id))?;
             } else if config.route_order == i {
-                let route_bytes = src.split_to(headers.route_len as usize);
-                route = String::from_utf8(route_bytes.into()).map_err(|_| {
-                    ProtocolError::InvalidFrame {
-                        message: "Invalid route",
-                        req_id: Some(headers.req_id),
-                    }
-                })?;
+                route = src.split_to(headers.route_len as usize).freeze();
             } else if config.payload_order == i {
                 payload = src.split_to(headers.payload_len as usize).freeze();
             }

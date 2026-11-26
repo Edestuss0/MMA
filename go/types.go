@@ -83,6 +83,8 @@ type ServerConfig struct {
 	DrainTimeout   time.Duration
 	ShutdownGrace  time.Duration
 	RequestTimeout time.Duration
+	WriteTimeout   time.Duration
+	SocketBackoff  time.Duration
 }
 
 // TLSConfig enables TLS without changing the existing ServerConfig layout.

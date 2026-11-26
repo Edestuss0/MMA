@@ -40,6 +40,8 @@ type nativeServerConfig struct {
 	drainTimeoutMS   uint64
 	shutdownGraceMS  uint64
 	requestTimeoutMS uint64
+	writeTimeoutMS   uint64
+	socketBackoffUS  uint64
 	tlsConfig        unsafe.Pointer
 }
 

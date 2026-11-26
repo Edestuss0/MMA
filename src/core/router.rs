@@ -18,6 +18,15 @@ pub enum ReservedRoutes {
     CHANNEL_DISCONNECT,
 }
 
+impl ReservedRoutes {
+    pub const fn as_bytes(&self) -> &'static [u8] {
+        match self {
+            Self::CHANNEL_CONNECT => b"CHANNEL_CONNECT",
+            Self::CHANNEL_DISCONNECT => b"CHANNEL_DISCONNECT",
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RouteError {
     #[error("route name is empty or too long")]
@@ -30,8 +39,8 @@ pub enum RouteError {
 
 #[derive(Clone)]
 pub struct Router {
-    routes: AHashMap<String, Handler>,
-    channel_handlers: AHashMap<String, ChannelHandler>,
+    routes: AHashMap<Bytes, Handler>,
+    channel_handlers: AHashMap<Bytes, ChannelHandler>,
     on_channel_connect_handler: Option<ChannelHandler>,
     on_channel_disconnect_handler: Option<ChannelHandler>,
 }
@@ -59,7 +68,9 @@ impl Router {
             return Err(RouteError::Reserved);
         }
 
-        if self.routes.contains_key(&route) || self.channel_handlers.contains_key(&route) {
+        if self.routes.contains_key(route.as_bytes())
+            || self.channel_handlers.contains_key(route.as_bytes())
+        {
             return Err(Duplicate);
         }
 
@@ -67,7 +78,7 @@ impl Router {
             Box::pin(handler(req, res))
         });
 
-        self.routes.insert(route, handler);
+        self.routes.insert(route.into(), handler);
         Ok(())
     }
 
@@ -88,7 +99,9 @@ impl Router {
             return Err(RouteError::Reserved);
         }
 
-        if self.routes.contains_key(&route) || self.channel_handlers.contains_key(&route) {
+        if self.routes.contains_key(route.as_bytes())
+            || self.channel_handlers.contains_key(route.as_bytes())
+        {
             return Err(Duplicate);
         }
 
@@ -96,7 +109,7 @@ impl Router {
             Box::pin(handler(req, conn_id))
         });
 
-        self.channel_handlers.insert(route, handler);
+        self.channel_handlers.insert(route.into(), handler);
 
         Result::Ok(())
     }

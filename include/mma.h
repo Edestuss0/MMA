@@ -77,6 +77,8 @@ typedef struct MMA_ServerConfig {
     uint64_t drain_timeout_ms;
     uint64_t shutdown_grace_ms;
     uint64_t request_timeout_ms;
+    uint64_t write_timeout_ms;
+    uint64_t socket_backoff_us;
     const MMA_TLSConfig *tls_config;
 } MMA_ServerConfig;
 
