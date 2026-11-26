@@ -3,9 +3,9 @@ use std::sync::{Arc, RwLock};
 use MMA::{
     config::config::{FramerConfig, MMA_VERSION, RESERVED_SUFFIX},
     core::commands::Response,
-    protocol::framer::{self, Framer},
+    protocol::framer::Framer,
 };
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use tokio_util::codec::Encoder;
 
 #[test]
@@ -64,7 +64,7 @@ fn encoding_small_payload_without_options_default_config() {
 
     for i in 1..=3 {
         if config.options_order == i {
-            options = body.split_to(options_len as usize);
+            options = body.split_to(options_len);
         } else if config.payload_order == i {
             payload = body.split_to(payload_len as usize);
         }
@@ -151,7 +151,7 @@ fn encoding_small_payload_with_options_default_config() {
 
     for i in 1..=3 {
         if config.options_order == i {
-            options = body.split_to(options_len as usize);
+            options = body.split_to(options_len);
         } else if config.payload_order == i {
             payload = body.split_to(payload_len as usize);
         }
@@ -229,7 +229,7 @@ fn encoding_small_payload_without_options_another_big_bytes() {
 
     for i in 1..=3 {
         if config.options_order == i {
-            options = body.split_to(options_len as usize);
+            options = body.split_to(options_len);
         } else if config.payload_order == i {
             payload = body.split_to(payload_len as usize);
         }
@@ -319,7 +319,7 @@ fn encoding_small_payload_with_options_another_big_bytes() {
 
     for i in 1..=3 {
         if config.options_order == i {
-            options = body.split_to(options_len as usize);
+            options = body.split_to(options_len);
         } else if config.payload_order == i {
             payload = body.split_to(payload_len as usize);
         }
@@ -400,7 +400,7 @@ fn encoding_small_payload_without_options_another_big_bytes_and_another_POR() {
 
     for i in 1..=3 {
         if config.options_order == i {
-            options = body.split_to(options_len as usize);
+            options = body.split_to(options_len);
         } else if config.payload_order == i {
             payload = body.split_to(payload_len as usize);
         }
@@ -493,7 +493,7 @@ fn encoding_small_payload_with_options_another_big_bytes_and_another_POR() {
 
     for i in 1..=3 {
         if config.options_order == i {
-            options = body.split_to(options_len as usize);
+            options = body.split_to(options_len);
         } else if config.payload_order == i {
             payload = body.split_to(payload_len as usize);
         }

@@ -37,6 +37,7 @@ pub struct Router {
 }
 
 impl Router {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             routes: AHashMap::new(),
@@ -164,13 +165,13 @@ impl Router {
     pub async fn on_channel_connect(&self, request: Request, conn_id: u32) {
         if let Some(h) = &self.on_channel_connect_handler {
             h(request, conn_id).await;
-        };
+        }
     }
 
     pub async fn on_channel_disconnect(&self, request: Request, conn_id: u32) {
         if let Some(h) = &self.on_channel_disconnect_handler {
             h(request, conn_id).await;
-        };
+        }
     }
 
     pub async fn handle_channel(&self, frame: Request, conn_id: &u32) -> Result<(), Response> {

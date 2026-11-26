@@ -41,7 +41,7 @@ impl ChannelHub {
             for sender in channels {
                 if sender.send(item.clone()).await.is_err() {
                     return Err(String::from("Error with sending"));
-                };
+                }
             }
         } else {
             let sender = {
@@ -60,7 +60,7 @@ impl ChannelHub {
 
             if sender.send(item).await.is_err() {
                 return Err(String::from("Error with sending"));
-            };
+            }
         }
 
         Ok(())
@@ -93,11 +93,10 @@ impl ChannelHub {
 
             if failed == 0 {
                 return Ok(());
-            } else {
-                return Err(format!(
-                    "Partial broadcast: {delivered}/{total} channels accepted the message"
-                ));
             }
+            return Err(format!(
+                "Partial broadcast: {delivered}/{total} channels accepted the message"
+            ));
         } else {
             let sender = {
                 let guard = self
@@ -115,7 +114,7 @@ impl ChannelHub {
 
             if sender.try_send(item).is_err() {
                 return Err(String::from("Error with sending"));
-            };
+            }
         }
 
         Ok(())

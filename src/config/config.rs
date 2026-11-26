@@ -42,7 +42,7 @@ pub enum ConfigError {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 8080),
+            address: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8080),
             frame_config: FramerConfig::default(),
             max_batch: 255,
             max_in_flight: 1024,
@@ -112,6 +112,7 @@ impl Default for BigBytesConfig {
 }
 
 impl BigBytesConfig {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             options_len_order: 1,

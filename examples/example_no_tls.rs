@@ -189,10 +189,7 @@ async fn send(req: Request, _: u32, handle: ServerHandle) {
 }
 
 async fn disconnect(req: Request, conn_id: u32, handle: ServerHandle) {
-    let payload = match str::from_utf8(&req.payload) {
-        Ok(v) => v,
-        Err(_) => "Invalid data",
-    };
+    let payload = str::from_utf8(&req.payload).unwrap_or("Invalid data");
 
     let mut response = Response::new(0);
     response.payload = Bytes::from(format!("Disconnect: payload: {}, id: {}", payload, conn_id));
@@ -201,10 +198,7 @@ async fn disconnect(req: Request, conn_id: u32, handle: ServerHandle) {
 }
 
 async fn connect(req: Request, conn_id: u32, handle: ServerHandle) {
-    let payload = match str::from_utf8(&req.payload) {
-        Ok(v) => v,
-        Err(_) => "Invalid data",
-    };
+    let payload = str::from_utf8(&req.payload).unwrap_or("Invalid data");
 
     let mut response = Response::new(0);
     response.payload = Bytes::from(format!("Connect: payload: {}, id: {}", payload, conn_id));

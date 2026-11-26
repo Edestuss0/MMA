@@ -264,7 +264,7 @@ pub struct MMA_Server {
 // ============================================================
 
 fn valid_slice<T>(data: *const T, len: usize) -> bool {
-    len == 0 || (!data.is_null() && len <= isize::MAX as usize)
+    len == 0 || (!data.is_null() && isize::try_from(len).is_ok())
 }
 
 unsafe fn raw_slice<'a, T>(data: *const T, len: usize) -> &'a [T] {
@@ -1176,7 +1176,7 @@ pub unsafe extern "C" fn mma_request_complete(
         let mut guard = state
             .response_tx
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         guard.take()
     };

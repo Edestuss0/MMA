@@ -20,7 +20,7 @@ impl Request {
         self.options
             .iter()
             .find(|x| x.0 == key)
-            .map(|v| v.1.to_owned())
+            .map(|v| v.1.clone())
     }
 }
 
@@ -103,6 +103,7 @@ pub enum ResponseOpcode {
 }
 
 impl ResponseOpcode {
+    #[must_use]
     pub fn from_number(number: u8) -> Option<Self> {
         match number {
             1 => Some(Ok),
@@ -129,6 +130,7 @@ pub struct Response {
 }
 
 impl Response {
+    #[must_use]
     pub fn new(req_id: u32) -> Self {
         Self {
             headers: ResponseHeaders {
@@ -145,6 +147,7 @@ impl Response {
         self.headers.opcode = status;
     }
 
+    #[must_use]
     pub fn graceful_shutdown_response(req_id: u32) -> Self {
         Self {
             headers: ResponseHeaders {
@@ -157,6 +160,7 @@ impl Response {
         }
     }
 
+    #[must_use]
     pub fn internal_error(req_id: u32) -> Self {
         Self {
             headers: ResponseHeaders {
@@ -184,6 +188,7 @@ impl Response {
         }
     }
 
+    #[must_use]
     pub fn connection_type_mismatch(req_id: u32) -> Self {
         Self {
             headers: ResponseHeaders {
@@ -196,6 +201,7 @@ impl Response {
         }
     }
 
+    #[must_use]
     pub fn channel_connected(req_id: u32) -> Self {
         Self {
             headers: ResponseHeaders {
@@ -220,6 +226,7 @@ impl Response {
         }
     }
 
+    #[must_use]
     pub fn timeout(req_id: u32) -> Self {
         Self {
             headers: ResponseHeaders {
@@ -241,6 +248,7 @@ pub enum SocketStatus {
 }
 
 impl SocketStatus {
+    #[must_use]
     pub fn to_u64(self) -> u64 {
         match self {
             SocketStatus::Fresh => 0,
@@ -249,6 +257,7 @@ impl SocketStatus {
         }
     }
 
+    #[must_use]
     pub fn from_u64(value: u64) -> Self {
         match value >> 32 {
             0 => SocketStatus::Fresh,

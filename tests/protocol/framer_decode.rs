@@ -1,7 +1,4 @@
-use std::{
-    hash::{BuildHasher, Hasher, RandomState},
-    sync::{Arc, RwLock},
-};
+use std::sync::{Arc, RwLock};
 
 use MMA::{
     config::config::{BigBytesConfig, FramerConfig, MMA_VERSION, RESERVED_SUFFIX},
@@ -590,7 +587,7 @@ fn decode_big_request_with_another_header_config_and_another_POR() {
         .saturating_sub(config.header_length as usize + opts_len + route.len());
 
     let payload_len = rng.random_range(0..=max_payload.min(1_000_000));
-    let mut payload = BytesMut::zeroed(payload_len as usize);
+    let payload = BytesMut::zeroed(payload_len as usize);
     let header = RequestHeaders {
         opcode: RequestOpcode::Once,
         options_count: options.len() as u8,
@@ -691,7 +688,7 @@ fn decode_big_request_with_another_header_config_and_another_POR_and_another_big
         .saturating_sub(config.header_length as usize + opts_len + route.len());
 
     let payload_len = rng.random_range(0..=max_payload.min(1_000_000));
-    let mut payload = BytesMut::zeroed(payload_len as usize);
+    let payload = BytesMut::zeroed(payload_len as usize);
     let header = RequestHeaders {
         opcode: RequestOpcode::Once,
         options_count: options.len() as u8,

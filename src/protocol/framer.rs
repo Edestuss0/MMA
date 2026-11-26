@@ -115,7 +115,7 @@ impl Encoder<Response> for Framer {
                     Err(e)
                 };
             }
-        };
+        }
 
         Ok(())
     }
@@ -176,10 +176,9 @@ impl Decoder for Framer {
             self.cached_config = Some(config);
             self.cached_header = Some(headers);
             return Ok(None);
-        } else {
-            self.cached_header = None;
-            self.cached_config = None;
         }
+        self.cached_header = None;
+        self.cached_config = None;
 
         let _hdr = src.split_to(config.header_length as usize);
 
@@ -205,8 +204,8 @@ impl Decoder for Framer {
         }
 
         Ok(Some(Request {
-            payload,
             headers,
+            payload,
             route,
             options,
         }))
@@ -269,7 +268,7 @@ fn decode_options(
             });
         }
 
-        return Ok(Vec::with_capacity(0));
+        return Ok(Vec::new());
     }
 
     let mut raw = raw.freeze();
@@ -418,7 +417,7 @@ fn decode_headers(bytes: &[u8], config: &FramerConfig) -> Result<RequestHeaders,
         })?;
 
     let (payload_len, options_len, req_id) = decode_big_bytes(big_bytes, &config.big_bytes_config)
-        .map_err(|_| ProtocolError::InvalidFrame {
+        .map_err(|()| ProtocolError::InvalidFrame {
             message: "Invalid big bytes trail",
             req_id: None,
         })?;
@@ -426,7 +425,7 @@ fn decode_headers(bytes: &[u8], config: &FramerConfig) -> Result<RequestHeaders,
     let opcode: RequestOpcode = match bytes.get((config.opcode_pos - 1) as usize) {
         Some(&value) => match RequestOpcode::try_from(value) {
             Ok(value) => value,
-            Err(_) => {
+            Err(()) => {
                 return Err(ProtocolError::InvalidFrame {
                     message: "Invalid opcode",
                     req_id: Some(req_id),
@@ -474,12 +473,12 @@ fn decode_headers(bytes: &[u8], config: &FramerConfig) -> Result<RequestHeaders,
     };
 
     Ok(RequestHeaders {
-        payload_len,
-        options_count,
-        version,
         opcode,
+        version,
+        payload_len,
         route_len,
-        req_id,
         options_len,
+        options_count,
+        req_id,
     })
 }

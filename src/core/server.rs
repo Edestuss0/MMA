@@ -128,19 +128,18 @@ impl Server {
             let conns_semaphore = Arc::clone(&conns_semaphore);
             let current_channel_connection_id = Arc::clone(&current_channel_connection_id);
             let mut socket = tokio::select! {
-                _ = &mut shutdown => break,
-                _ = stop.cancelled() => break,
+                () = &mut shutdown => break,
+                () = stop.cancelled() => break,
                 acc = self.tcp_listener.accept() => match acc {
                     Result::Ok((socket, _)) => socket,
                     Result::Err(e) => { result = Err(e); continue; }
                 },
             };
-            let permit = match conns_semaphore.try_acquire_owned() {
-                Result::Ok(p) => p,
-                Err(_) => {
-                    socket.shutdown().await?;
-                    continue;
-                }
+            let permit = if let Result::Ok(p) = conns_semaphore.try_acquire_owned() {
+                p
+            } else {
+                socket.shutdown().await?;
+                continue;
             };
 
             let _ = socket.set_nodelay(true);
@@ -161,7 +160,7 @@ impl Server {
                         match tokio::time::timeout(tht, ta.accept(socket)).await {
                             Ok(Ok(ts)) => Box::new(ts),
                             Ok(Err(e)) => {
-                                eprintln!("TLS Handshake failed: {}", e);
+                                eprintln!("TLS Handshake failed: {e}");
                                 return;
                             }
                             Err(_) => {
