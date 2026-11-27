@@ -12,13 +12,14 @@ type Handler = Arc<dyn for<'a> Fn(Request, Response) -> BoxFuture<'static, Respo
 type ChannelHandler = Arc<dyn Fn(Request, u32) -> BoxFuture<'static, ()> + Send + Sync>;
 
 #[allow(non_camel_case_types)]
-#[derive(Debug, PartialEq, EnumString, Display)]
+#[derive(Debug, PartialEq, Eq, EnumString, Display)]
 pub enum ReservedRoutes {
     CHANNEL_CONNECT,
     CHANNEL_DISCONNECT,
 }
 
 impl ReservedRoutes {
+    #[must_use]
     pub const fn as_bytes(&self) -> &'static [u8] {
         match self {
             Self::CHANNEL_CONNECT => b"CHANNEL_CONNECT",

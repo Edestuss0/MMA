@@ -23,6 +23,7 @@ use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
+use tokio::sync::mpsc::Sender;
 use tokio::sync::watch;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
@@ -33,6 +34,118 @@ use tokio_util::task::TaskTracker;
 pub trait AsyncConnection: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
 
 impl<T> AsyncConnection for T where T: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
+
+struct ConnectionContext<F, T> {
+    pub on_channel_connect: F,
+    pub on_channel_disconnect: T,
+    pub socket_status: AtomicU64,
+    pub disconnect: CancellationToken,
+    pub channel_task: Mutex<Option<JoinHandle<()>>>,
+    pub response_tx: Sender<Response>,
+    pub router: Arc<Router>,
+}
+
+impl<F, T> ConnectionContext<F, T>
+where
+    F: Fn() -> Result<(SocketStatus, mpsc::Receiver<Response>), String> + Send + Sync,
+    T: Fn(u32) -> Result<(), String> + Send + Sync,
+{
+    pub async fn register_connect(&self, req: Request) -> Result<(), String> {
+        if !matches!(
+            SocketStatus::from_u64(self.socket_status.load(Ordering::Relaxed)),
+            SocketStatus::Fresh
+        ) {
+            return Err(String::from("Socket isn't fresh"));
+        }
+
+        if change_socket_status(
+            SocketStatus::Fresh,
+            SocketStatus::Connecting,
+            &self.socket_status,
+        )
+        .is_err()
+        {
+            return Err(String::from("Socket isn't fresh"));
+        }
+
+        let (status, mut receiver) = match (self.on_channel_connect)() {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = change_socket_status(
+                    SocketStatus::Connecting,
+                    SocketStatus::Fresh,
+                    &self.socket_status,
+                );
+                return Err(format!("Error with connecting to channel: {e}"));
+            }
+        };
+
+        let conn_id = if let SocketStatus::Channel(id) = status {
+            id
+        } else {
+            let _ = change_socket_status(
+                SocketStatus::Connecting,
+                SocketStatus::Fresh,
+                &self.socket_status,
+            );
+            return Err(String::from("Cannot connect to channel"));
+        };
+
+        if AssertUnwindSafe(self.router.on_channel_connect(req, conn_id))
+            .catch_unwind()
+            .await
+            .is_err()
+        {
+            let _ = change_socket_status(
+                SocketStatus::Connecting,
+                SocketStatus::Fresh,
+                &self.socket_status,
+            );
+            if let Err(_e) = (self.on_channel_disconnect)(conn_id) {
+                eprintln!("Error with cancelling of channel connection");
+            }
+            self.disconnect.cancel();
+
+            return Err(String::from("Cannot complete"));
+        }
+
+        let tx_channel = self.response_tx.clone();
+
+        let relay_task = tokio::spawn(async move {
+            while let Some(message) = receiver.recv().await {
+                if tx_channel.send(message).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        match self.channel_task.lock() {
+            Ok(mut slot) => {
+                if let Some(previous) = slot.replace(relay_task) {
+                    previous.abort();
+                }
+            }
+
+            Err(_) => {
+                relay_task.abort();
+            }
+        }
+
+        change_socket_status(SocketStatus::Connecting, status, &self.socket_status)
+            .map_err(|()| String::from("Cannot change socket status"))?;
+        Ok(())
+    }
+
+    pub fn disconnect_channel(&self) {
+        let status = SocketStatus::from_u64(self.socket_status.load(Ordering::Relaxed));
+        if let SocketStatus::Channel(id) = status
+            && let Err(e) = (self.on_channel_disconnect)(id)
+        {
+            eprintln!("Error with channel disconnecting: {e}");
+        }
+        self.disconnect.cancel();
+    }
+}
 
 pub async fn serve_connection<S, F, T>(
     socket: S,
@@ -65,26 +178,26 @@ pub async fn serve_connection<S, F, T>(
     let (sink, mut stream) = framed.split();
     let (tx, rx) = tokio::sync::mpsc::channel::<Response>(1000);
     let inflight = TaskTracker::new();
-
-    let tx_copy = tx.clone();
-
-    let on_channel_connect = Arc::new(on_channel_connect);
-    let socket_status = Arc::new(AtomicU64::new(SocketStatus::to_u64(SocketStatus::Fresh)));
-    let channel_task: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
-
     let mut writer = writer(sink, rx, config.max_batch, config.write_timeout);
-    let on_channel_disconnect = Arc::new(on_channel_disconnect);
-    let disconnect = CancellationToken::new();
-    let channel_connection_semaphore = Arc::new(Semaphore::new(1));
+
+    let context = Arc::new(ConnectionContext {
+        channel_task: Mutex::new(None),
+        disconnect: CancellationToken::new(),
+        on_channel_connect,
+        on_channel_disconnect,
+        response_tx: tx.clone(),
+        router,
+        socket_status: AtomicU64::new(SocketStatus::to_u64(SocketStatus::Fresh)),
+    });
 
     loop {
         let frame = tokio::select! {
             biased;
             () = kill.cancelled() => break,
             () = stop.cancelled() => break,
-            () = disconnect.cancelled() => {
-                if let SocketStatus::Channel(id) = SocketStatus::from_u64(socket_status.load(Ordering::Relaxed)) {
-                    let _ = on_channel_disconnect(id);
+            () = context.disconnect.cancelled() => {
+                if let SocketStatus::Channel(id) = SocketStatus::from_u64(context.socket_status.load(Ordering::Relaxed)) {
+                    let _ = (context.on_channel_disconnect)(id);
                 }
                 break;
             },
@@ -109,9 +222,9 @@ pub async fn serve_connection<S, F, T>(
                 continue;
             }
             f = stream.next() => if let Some(f) = f { f } else {
-                let status = SocketStatus::from_u64(socket_status.load(Ordering::Relaxed));
+                let status = SocketStatus::from_u64(context.socket_status.load(Ordering::Relaxed));
                 if let SocketStatus::Channel(id) = status
-                    && let Err(e) = on_channel_disconnect(id) {
+                    && let Err(e) = (context.on_channel_disconnect)(id) {
                         eprintln!("Error with channel disconnecting: {e}");
                     }
                 break;
@@ -128,128 +241,13 @@ pub async fn serve_connection<S, F, T>(
                 };
 
                 let tx = tx.clone();
-                let router = Arc::clone(&router);
-                let on_channel_connect = Arc::clone(&on_channel_connect);
-                let socket_status = Arc::clone(&socket_status);
-                let socket_status_for_connect = Arc::clone(&socket_status);
                 let req_id = cmd.headers.req_id;
-
                 let request_timeout = config.request_timeout;
-
-                let channel_task_for_cmd = Arc::clone(&channel_task);
-                let tx_for_channel = tx_copy.clone();
-
-                let disconnect = disconnect.clone();
-                let disconnect_for_connect = disconnect.clone();
-
-                let socket_status_disc = Arc::clone(&socket_status);
-                let on_channel_disconnect = Arc::clone(&on_channel_disconnect);
-                let on_channel_disconnect_for_cancel = Arc::clone(&on_channel_disconnect);
-                let channel_connection_semaphore = Arc::clone(&channel_connection_semaphore);
-                let router_for_connect = Arc::clone(&router);
-
+                let context = context.clone();
                 inflight.spawn(async move {
                     match tokio::time::timeout(
                         request_timeout,
-                        handle_cmd(
-                            cmd,
-                            socket_status,
-                            permit_global,
-                            router,
-                            Arc::new(async move |req| -> Result<(), String> {
-                                if !matches!(
-                                    SocketStatus::from_u64(
-                                        socket_status_for_connect.load(Ordering::Relaxed)
-                                    ),
-                                    SocketStatus::Fresh
-                                ) {
-                                    return Err(String::from("Socket isn't fresh"));
-                                }
-                                let _permit =
-                                channel_connection_semaphore.try_acquire().map_err(|_| {
-                                        String::from("Socket is already connectiong to channel")
-                                    })?;
-
-                                let (status, mut receiver) = match on_channel_connect() {
-                                    Ok(s) => s,
-                                    Err(e) => {
-                                        return Err(format!(
-                                            "Error with connecting to channel: {e}"
-                                        ));
-                                    }
-                                };
-
-                                let conn_id = match status {
-                                    SocketStatus::Channel(id) => id,
-                                    _ => return Err(String::from("Cannot connect to channel")),
-                                };
-                                
-                                if change_socket_status(
-                                    SocketStatus::Fresh,
-                                    SocketStatus::Connecting,
-                                    &socket_status_for_connect,
-                                )
-                                .is_err()
-                                {
-                                    if let Err(_e) = on_channel_disconnect_for_cancel(conn_id) {
-                                        eprintln!("Error with cancelling of channel connection");
-                                    }
-
-                                    return Err(String::from("Socket isn't fresh"));
-                                }
-                                
-                                let tx_channel = tx_for_channel.clone();
-                                
-                                let relay_task = tokio::spawn(async move {
-                                    while let Some(message) = receiver.recv().await {
-                                        if tx_channel.send(message).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                });
-
-                                match channel_task_for_cmd.lock() {
-                                    Ok(mut slot) => {
-                                        if let Some(previous) = slot.replace(relay_task) {
-                                            previous.abort();
-                                        }
-                                    }
-
-                                    Err(_) => {
-                                        relay_task.abort();
-                                    }
-                                }
-
-                                if AssertUnwindSafe(router_for_connect.on_channel_connect(req, conn_id))
-                                    .catch_unwind()
-                                    .await
-                                    .is_err()
-                                {
-                                    socket_status_for_connect.store(SocketStatus::to_u64(SocketStatus::Fresh), Ordering::Relaxed);
-                                    if let Err(_e) = on_channel_disconnect_for_cancel(conn_id) {
-                                        eprintln!("Error with cancelling of channel connection");
-                                    }
-                                    disconnect_for_connect.cancel();
-    
-                                    return Err(String::from("Cannot complete"))
-                                }
-
-                                socket_status_for_connect.store(SocketStatus::to_u64(status), Ordering::Relaxed);
-
-                                Ok(())
-                            }),
-                            Arc::new(move || {
-                                let status = SocketStatus::from_u64(
-                                    socket_status_disc.load(Ordering::Relaxed),
-                                );
-                                if let SocketStatus::Channel(id) = status
-                                    && let Err(e) = on_channel_disconnect(id)
-                                {
-                                    eprintln!("Error with channel disconnecting: {e}");
-                                }
-                                disconnect.cancel();
-                            }),
-                        ),
+                        handle_cmd(cmd, permit_global, context),
                     )
                     .await
                     {
@@ -295,23 +293,24 @@ pub async fn serve_connection<S, F, T>(
         }
     }
 
-    let status = SocketStatus::from_u64(socket_status.load(Ordering::Relaxed));
+    let status = SocketStatus::from_u64(context.socket_status.load(Ordering::Relaxed));
 
     if let SocketStatus::Channel(id) = status
-        && let Err(e) = on_channel_disconnect(id)
+        && let Err(e) = (context.on_channel_disconnect)(id)
     {
         eprintln!("Error with channel disconnect: {e}");
     }
 
     inflight.close();
     tokio::select! { () = inflight.wait() => {}, () = kill.cancelled() => {} }
-    drop(tx);
-    drop(conn_permit);
-    if let Ok(mut slot) = channel_task.lock()
+    if let Ok(mut slot) = context.channel_task.lock()
         && let Some(task) = slot.take()
     {
         task.abort();
     }
+    drop(context);
+    drop(tx);
+    drop(conn_permit);
     if kill.is_cancelled() {
         writer.abort();
         let _ = writer.await;
@@ -329,15 +328,12 @@ pub async fn serve_connection<S, F, T>(
 
 async fn handle_cmd<F, T>(
     cmd: Request,
-    socket_status: Arc<AtomicU64>,
     permit: OwnedSemaphorePermit,
-    router: Arc<Router>,
-    on_channel_connect: Arc<F>,
-    on_channel_disconnect: Arc<T>,
+    context: Arc<ConnectionContext<F, T>>,
 ) -> Option<Response>
 where
-    F: AsyncFn(Request) -> Result<(), String> + Send + Sync + 'static,
-    T: Fn() + Send + Sync + 'static,
+    F: Fn() -> Result<(SocketStatus, mpsc::Receiver<Response>), String> + Send + Sync + 'static,
+    T: Fn(u32) -> Result<(), String> + Send + Sync + 'static,
 {
     let req_id = cmd.headers.req_id;
 
@@ -345,17 +341,24 @@ where
         return Some(e);
     }
 
-    let status = SocketStatus::from_u64(socket_status.load(Ordering::Relaxed));
+    let status = SocketStatus::from_u64(context.socket_status.load(Ordering::Relaxed));
 
     match status {
         SocketStatus::Fresh => match cmd.headers.opcode {
             RequestOpcode::Once => {
-                if change_socket_status(SocketStatus::Fresh, SocketStatus::Once, &socket_status)
-                    .is_err()
+                if change_socket_status(
+                    SocketStatus::Fresh,
+                    SocketStatus::Once,
+                    &context.socket_status,
+                )
+                .is_err()
                 {
                     return None;
                 }
-                let response = match AssertUnwindSafe(router.handle(cmd)).catch_unwind().await {
+                let response = match AssertUnwindSafe(context.router.handle(cmd))
+                    .catch_unwind()
+                    .await
+                {
                     Ok(response) => response,
                     Err(_) => Response::internal_error(req_id),
                 };
@@ -366,10 +369,10 @@ where
             }
             RequestOpcode::ChannelConnect => {
                 if cmd.route == ReservedRoutes::CHANNEL_CONNECT.as_bytes() {
-                    if let Err(e) = on_channel_connect(cmd).await {
-                            let mut response = Response::internal_error(req_id);
-                            response.payload = Bytes::from(e);
-                            return Some(response);
+                    if let Err(e) = context.register_connect(cmd).await {
+                        let mut response = Response::internal_error(req_id);
+                        response.payload = Bytes::from(e);
+                        return Some(response);
                     }
 
                     drop(permit);
@@ -394,7 +397,10 @@ where
         },
         SocketStatus::Once => {
             if cmd.headers.opcode == RequestOpcode::Once {
-                let response = match AssertUnwindSafe(router.handle(cmd)).catch_unwind().await {
+                let response = match AssertUnwindSafe(context.router.handle(cmd))
+                    .catch_unwind()
+                    .await
+                {
                     Ok(response) => response,
                     Err(_) => Response::internal_error(req_id),
                 };
@@ -402,10 +408,9 @@ where
                 drop(permit);
 
                 return Some(response);
-            } else {
-                drop(permit);
-                return Some(Response::connection_type_mismatch(req_id));
             }
+            drop(permit);
+            return Some(Response::connection_type_mismatch(req_id));
         }
         SocketStatus::Channel(conn_id) => match cmd.headers.opcode {
             RequestOpcode::ChannelConnect => {
@@ -417,17 +422,17 @@ where
             }
             RequestOpcode::ChannelMessage => {
                 if cmd.route == ReservedRoutes::CHANNEL_DISCONNECT.as_bytes() {
-                    if AssertUnwindSafe(router.on_channel_disconnect(cmd.clone(), conn_id))
+                    if AssertUnwindSafe(context.router.on_channel_disconnect(cmd.clone(), conn_id))
                         .catch_unwind()
                         .await
                         .is_err()
                     {
                         return Some(Response::internal_error(req_id));
                     }
-                    on_channel_disconnect();
+                    context.disconnect_channel();
                     return None;
                 }
-                match AssertUnwindSafe(router.handle_channel(cmd, &conn_id))
+                match AssertUnwindSafe(context.router.handle_channel(cmd, &conn_id))
                     .catch_unwind()
                     .await
                 {

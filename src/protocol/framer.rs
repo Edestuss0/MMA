@@ -17,7 +17,7 @@ pub struct Framer {
 impl Framer {
     pub fn new(cfg: Arc<RwLock<FramerConfig>>) -> Result<Self, ConfigError> {
         let config = cfg.read().expect("lock poisoned").clone();
-        config.validate().map_err(|_| ConfigError::Framer)?;
+        config.validate().map_err(|()| ConfigError::Framer)?;
         Ok(Self {
             config: cfg,
             cached_header: None,

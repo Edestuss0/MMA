@@ -9,7 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[tokio::main]
 async fn main() {
     let config = Config {
-        address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 8080),
+        address: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8080),
         frame_config: FramerConfig {
             opcode_pos: 1,
             version_pos: 4,
@@ -38,7 +38,7 @@ async fn main() {
     let mut server = match Server::new(config).await {
         Ok(value) => value,
         Err(e) => {
-            println!("Error: {}", e);
+            println!("Error: {e}");
             panic!()
         }
     };
@@ -121,7 +121,7 @@ async fn echo(req: Request, mut res: Response) -> Response {
 
 async fn change(_req: Request, res: Response, handle: ServerHandle) -> Response {
     let config = Config {
-        address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 8080),
+        address: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8080),
         frame_config: FramerConfig {
             opcode_pos: 1,
             version_pos: 4,
@@ -149,18 +149,17 @@ async fn change(_req: Request, res: Response, handle: ServerHandle) -> Response 
 }
 
 async fn pow(req: Request, mut res: Response) -> Response {
-    let number = match str::from_utf8(&req.payload)
+    let number = if let Some(r) = str::from_utf8(&req.payload)
         .ok()
         .and_then(|s| s.trim().parse::<i32>().ok())
     {
-        Some(r) => r,
-        None => {
-            res.set_status(ResponseOpcode::BadRequest);
-            res.payload = Bytes::from("Invalid payload");
-            return res;
-        }
+        r
+    } else {
+        res.set_status(ResponseOpcode::BadRequest);
+        res.payload = Bytes::from("Invalid payload");
+        return res;
     };
-    let pow = match req.get_option("pow".as_bytes()) {
+    let pow = match req.get_option(b"pow") {
         Some(value) => str::from_utf8(&value).unwrap().parse::<u32>().unwrap(),
         None => 2,
     };
@@ -185,7 +184,7 @@ async fn disconnect(req: Request, conn_id: u32, handle: ServerHandle) {
     let payload = str::from_utf8(&req.payload).unwrap_or("Invalid data");
 
     let mut response = Response::new(0);
-    response.payload = Bytes::from(format!("Disconnect: payload: {}, id: {}", payload, conn_id));
+    response.payload = Bytes::from(format!("Disconnect: payload: {payload}, id: {conn_id}"));
 
     let _ = handle.send_to_channel(0, response).await;
 }
@@ -194,7 +193,7 @@ async fn connect(req: Request, conn_id: u32, handle: ServerHandle) {
     let payload = str::from_utf8(&req.payload).unwrap_or("Invalid data");
 
     let mut response = Response::new(0);
-    response.payload = Bytes::from(format!("Connect: payload: {}, id: {}", payload, conn_id));
+    response.payload = Bytes::from(format!("Connect: payload: {payload}, id: {conn_id}"));
 
     let _ = handle.send_to_channel(0, response).await;
 }

@@ -39,7 +39,6 @@ fn decode_simple_request_with_default_config() {
         (Bytes::from("key2"), Bytes::from("value2")),
     ];
     let opts_len: usize = options
-        .clone()
         .iter()
         .map(|(key, value)| key.len() + value.len() + 4)
         .sum();
@@ -104,7 +103,7 @@ fn decode_simple_request_with_default_config() {
 
     let req = framer.decode(&mut bytes).unwrap().unwrap();
 
-    assert!(req == original_req);
+    assert_eq!(req, original_req);
 }
 
 #[test]
@@ -122,7 +121,6 @@ fn decode_simple_request_with_another_header_config() {
         (Bytes::from("key2"), Bytes::from("value2")),
     ];
     let opts_len: usize = options
-        .clone()
         .iter()
         .map(|(key, value)| key.len() + value.len() + 4)
         .sum();
@@ -187,7 +185,7 @@ fn decode_simple_request_with_another_header_config() {
 
     let req = framer.decode(&mut bytes).unwrap().unwrap();
 
-    assert!(req == original_req);
+    assert_eq!(req, original_req);
 }
 
 #[test]
@@ -208,7 +206,6 @@ fn decode_simple_request_with_another_header_config_and_another_POR() {
         (Bytes::from("key2"), Bytes::from("value2")),
     ];
     let opts_len: usize = options
-        .clone()
         .iter()
         .map(|(key, value)| key.len() + value.len() + 4)
         .sum();
@@ -273,7 +270,7 @@ fn decode_simple_request_with_another_header_config_and_another_POR() {
 
     let req = framer.decode(&mut bytes).unwrap().unwrap();
 
-    assert!(req == original_req);
+    assert_eq!(req, original_req);
 }
 
 #[test]
@@ -297,7 +294,6 @@ fn decode_simple_request_with_another_header_config_and_another_POR_and_another_
         (Bytes::from("key2"), Bytes::from("value2")),
     ];
     let opts_len: usize = options
-        .clone()
         .iter()
         .map(|(key, value)| key.len() + value.len() + 4)
         .sum();
@@ -362,7 +358,7 @@ fn decode_simple_request_with_another_header_config_and_another_POR_and_another_
 
     let req = framer.decode(&mut bytes).unwrap().unwrap();
 
-    assert!(req == original_req);
+    assert_eq!(req, original_req);
 }
 
 #[test]
@@ -375,8 +371,8 @@ fn decode_big_request_with_default_config() {
     let mut options = Vec::with_capacity(opts_count as usize);
 
     for i in 1..=opts_count {
-        let key = format!("key{}", i);
-        let value = format!("value{}", i);
+        let key = format!("key{i}");
+        let value = format!("value{i}");
 
         options.push((Bytes::from(key), Bytes::from(value)));
     }
@@ -453,7 +449,7 @@ fn decode_big_request_with_default_config() {
 
     let req = framer.decode(&mut bytes).unwrap().unwrap();
 
-    assert!(req == original_req);
+    assert_eq!(req, original_req);
 }
 
 #[test]
@@ -471,8 +467,8 @@ fn decode_big_request_with_another_header_config() {
     let mut options = Vec::with_capacity(opts_count as usize);
 
     for i in 1..=opts_count {
-        let key = format!("key{}", i);
-        let value = format!("value{}", i);
+        let key = format!("key{i}");
+        let value = format!("value{i}");
 
         options.push((Bytes::from(key), Bytes::from(value)));
     }
@@ -549,7 +545,7 @@ fn decode_big_request_with_another_header_config() {
 
     let req = framer.decode(&mut bytes).unwrap().unwrap();
 
-    assert!(req == original_req);
+    assert_eq!(req, original_req);
 }
 
 #[test]
@@ -570,8 +566,8 @@ fn decode_big_request_with_another_header_config_and_another_POR() {
     let mut options = Vec::with_capacity(opts_count as usize);
 
     for i in 1..=opts_count {
-        let key = format!("key{}", i);
-        let value = format!("value{}", i);
+        let key = format!("key{i}");
+        let value = format!("value{i}");
 
         options.push((Bytes::from(key), Bytes::from(value)));
     }
@@ -648,7 +644,7 @@ fn decode_big_request_with_another_header_config_and_another_POR() {
 
     let req = framer.decode(&mut bytes).unwrap().unwrap();
 
-    assert!(req == original_req);
+    assert_eq!(req, original_req);
 }
 
 #[test]
@@ -672,8 +668,8 @@ fn decode_big_request_with_another_header_config_and_another_POR_and_another_big
     let mut options = Vec::with_capacity(opts_count as usize);
 
     for i in 1..=opts_count {
-        let key = format!("key{}", i);
-        let value = format!("value{}", i);
+        let key = format!("key{i}");
+        let value = format!("value{i}");
 
         options.push((Bytes::from(key), Bytes::from(value)));
     }
@@ -749,5 +745,5 @@ fn decode_big_request_with_another_header_config_and_another_POR_and_another_big
 
     let req = framer.decode(&mut bytes).unwrap().unwrap();
 
-    assert!(req == original_req);
+    assert_eq!(req, original_req);
 }

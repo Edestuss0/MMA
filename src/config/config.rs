@@ -125,7 +125,7 @@ impl Default for BigBytesConfig {
 
 impl BigBytesConfig {
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             options_len_order: 1,
             payload_len_order: 2,

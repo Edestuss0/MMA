@@ -13,7 +13,7 @@ pub struct ServerHandle {
 }
 
 impl ServerHandle {
-    pub fn new(config_sender: watch::Sender<Config>, channel_hub: Arc<ChannelHub>) -> Self {
+    pub const fn new(config_sender: watch::Sender<Config>, channel_hub: Arc<ChannelHub>) -> Self {
         Self {
             config_sender,
             channel_hub,

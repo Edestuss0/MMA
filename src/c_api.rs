@@ -179,11 +179,11 @@ struct CancellationGuard {
 }
 
 impl CancellationGuard {
-    fn new(token: CancellationToken) -> Self {
+    const fn new(token: CancellationToken) -> Self {
         Self { token, armed: true }
     }
 
-    fn disarm(&mut self) {
+    const fn disarm(&mut self) {
         self.armed = false;
     }
 }
@@ -202,7 +202,7 @@ impl Drop for CancellationGuard {
  * C must only use pointers obtained from an active callback,
  * or pointers for which it owns a retained Arc reference.
  */
-unsafe fn request_state<'a>(request: *const MMA_Request) -> Option<&'a RequestState> {
+const unsafe fn request_state<'a>(request: *const MMA_Request) -> Option<&'a RequestState> {
     if request.is_null() {
         return None;
     }
@@ -269,7 +269,7 @@ fn valid_slice<T>(data: *const T, len: usize) -> bool {
     len == 0 || (!data.is_null() && isize::try_from(len).is_ok())
 }
 
-unsafe fn raw_slice<'a, T>(data: *const T, len: usize) -> &'a [T] {
+const unsafe fn raw_slice<'a, T>(data: *const T, len: usize) -> &'a [T] {
     if len == 0 {
         &[]
     } else {
@@ -283,7 +283,7 @@ unsafe fn raw_slice<'a, T>(data: *const T, len: usize) -> &'a [T] {
 // Framer configuration conversion
 // ============================================================
 
-fn framer_config_from_c(config: MMA_FramerConfig) -> Option<FramerConfig> {
+const fn framer_config_from_c(config: MMA_FramerConfig) -> Option<FramerConfig> {
     if config.options_key_first > 1 {
         return None;
     }

@@ -7,7 +7,7 @@ use bytes::Bytes;
 use std::io;
 use thiserror::Error;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
     pub headers: RequestHeaders,
     pub payload: Bytes,
@@ -24,7 +24,7 @@ impl Request {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestHeaders {
     pub opcode: RequestOpcode,
     pub version: u8,
@@ -47,9 +47,9 @@ impl TryFrom<u8> for RequestOpcode {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            2 => Result::Ok(RequestOpcode::Once),
-            1 => Result::Ok(RequestOpcode::ChannelConnect),
-            3 => Result::Ok(RequestOpcode::ChannelMessage),
+            2 => Result::Ok(Self::Once),
+            1 => Result::Ok(Self::ChannelConnect),
+            3 => Result::Ok(Self::ChannelMessage),
             _ => Err(()),
         }
     }
@@ -104,7 +104,7 @@ pub enum ResponseOpcode {
 
 impl ResponseOpcode {
     #[must_use]
-    pub fn from_number(number: u8) -> Option<Self> {
+    pub const fn from_number(number: u8) -> Option<Self> {
         match number {
             1 => Some(Ok),
             2 => Some(BadRequest),
@@ -131,7 +131,7 @@ pub struct Response {
 
 impl Response {
     #[must_use]
-    pub fn new(req_id: u32) -> Self {
+    pub const fn new(req_id: u32) -> Self {
         Self {
             headers: ResponseHeaders {
                 version: MMA_VERSION,
@@ -143,7 +143,7 @@ impl Response {
         }
     }
 
-    pub fn set_status(&mut self, status: ResponseOpcode) {
+    pub const fn set_status(&mut self, status: ResponseOpcode) {
         self.headers.opcode = status;
     }
 
@@ -214,7 +214,7 @@ impl Response {
         }
     }
 
-    pub fn conflict(req_id: u32, payload: Bytes) -> Self {
+    pub const fn conflict(req_id: u32, payload: Bytes) -> Self {
         Self {
             headers: ResponseHeaders {
                 version: MMA_VERSION,
@@ -245,28 +245,28 @@ pub enum SocketStatus {
     Fresh,
     Once,
     Channel(u32),
-    Connecting
+    Connecting,
 }
 
 impl SocketStatus {
     #[must_use]
     pub fn to_u64(self) -> u64 {
         match self {
-            SocketStatus::Fresh => 0,
-            SocketStatus::Once => 1_u64 << 32,
-            SocketStatus::Channel(id) => (2_u64 << 32) | u64::from(id),
-            SocketStatus::Connecting => 3_u64 << 32
+            Self::Fresh => 0,
+            Self::Once => 1_u64 << 32,
+            Self::Channel(id) => (2_u64 << 32) | u64::from(id),
+            Self::Connecting => 3_u64 << 32,
         }
     }
 
     #[must_use]
-    pub fn from_u64(value: u64) -> Self {
+    pub const fn from_u64(value: u64) -> Self {
         match value >> 32 {
-            0 => SocketStatus::Fresh,
-            1 => SocketStatus::Once,
-            2 => SocketStatus::Channel(value as u32),
-            3 => SocketStatus::Connecting,
-            _ => SocketStatus::Fresh,
+            0 => Self::Fresh,
+            1 => Self::Once,
+            2 => Self::Channel(value as u32),
+            3 => Self::Connecting,
+            _ => Self::Fresh,
         }
     }
 }
