@@ -245,6 +245,7 @@ pub enum SocketStatus {
     Fresh,
     Once,
     Channel(u32),
+    Connecting
 }
 
 impl SocketStatus {
@@ -254,6 +255,7 @@ impl SocketStatus {
             SocketStatus::Fresh => 0,
             SocketStatus::Once => 1_u64 << 32,
             SocketStatus::Channel(id) => (2_u64 << 32) | u64::from(id),
+            SocketStatus::Connecting => 3_u64 << 32
         }
     }
 
@@ -263,6 +265,7 @@ impl SocketStatus {
             0 => SocketStatus::Fresh,
             1 => SocketStatus::Once,
             2 => SocketStatus::Channel(value as u32),
+            3 => SocketStatus::Connecting,
             _ => SocketStatus::Fresh,
         }
     }

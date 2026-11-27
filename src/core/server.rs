@@ -134,7 +134,7 @@ impl Server {
                     Result::Ok((socket, _)) => socket,
                     Result::Err(e) => {
                         result = Err(e);
-                        tokio::time::sleep(self.config.socket_backoff);
+                        tokio::time::sleep(self.config.socket_backoff).await;
                         continue;
                     }
                 },

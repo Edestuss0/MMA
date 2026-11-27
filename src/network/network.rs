@@ -82,7 +82,12 @@ pub async fn serve_connection<S, F, T>(
             biased;
             () = kill.cancelled() => break,
             () = stop.cancelled() => break,
-            () = disconnect.cancelled() => break,
+            () = disconnect.cancelled() => {
+                if let SocketStatus::Channel(id) = SocketStatus::from_u64(socket_status.load(Ordering::Relaxed)) {
+                    let _ = on_channel_disconnect(id);
+                }
+                break;
+            },
             changed = config_receiver.changed() => {
                 if changed.is_err() {
                     break;
@@ -135,11 +140,13 @@ pub async fn serve_connection<S, F, T>(
                 let tx_for_channel = tx_copy.clone();
 
                 let disconnect = disconnect.clone();
+                let disconnect_for_connect = disconnect.clone();
 
                 let socket_status_disc = Arc::clone(&socket_status);
                 let on_channel_disconnect = Arc::clone(&on_channel_disconnect);
                 let on_channel_disconnect_for_cancel = Arc::clone(&on_channel_disconnect);
                 let channel_connection_semaphore = Arc::clone(&channel_connection_semaphore);
+                let router_for_connect = Arc::clone(&router);
 
                 inflight.spawn(async move {
                     match tokio::time::timeout(
@@ -149,7 +156,7 @@ pub async fn serve_connection<S, F, T>(
                             socket_status,
                             permit_global,
                             router,
-                            Arc::new(move || -> Result<u32, String> {
+                            Arc::new(async move |req| -> Result<(), String> {
                                 if !matches!(
                                     SocketStatus::from_u64(
                                         socket_status_for_connect.load(Ordering::Relaxed)
@@ -158,8 +165,8 @@ pub async fn serve_connection<S, F, T>(
                                 ) {
                                     return Err(String::from("Socket isn't fresh"));
                                 }
-                                let permit =
-                                    channel_connection_semaphore.try_acquire().map_err(|_| {
+                                let _permit =
+                                channel_connection_semaphore.try_acquire().map_err(|_| {
                                         String::from("Socket is already connectiong to channel")
                                     })?;
 
@@ -176,10 +183,10 @@ pub async fn serve_connection<S, F, T>(
                                     SocketStatus::Channel(id) => id,
                                     _ => return Err(String::from("Cannot connect to channel")),
                                 };
-
+                                
                                 if change_socket_status(
                                     SocketStatus::Fresh,
-                                    status,
+                                    SocketStatus::Connecting,
                                     &socket_status_for_connect,
                                 )
                                 .is_err()
@@ -190,11 +197,9 @@ pub async fn serve_connection<S, F, T>(
 
                                     return Err(String::from("Socket isn't fresh"));
                                 }
-
-                                drop(permit);
-
+                                
                                 let tx_channel = tx_for_channel.clone();
-
+                                
                                 let relay_task = tokio::spawn(async move {
                                     while let Some(message) = receiver.recv().await {
                                         if tx_channel.send(message).await.is_err() {
@@ -215,7 +220,23 @@ pub async fn serve_connection<S, F, T>(
                                     }
                                 }
 
-                                Ok(conn_id)
+                                if AssertUnwindSafe(router_for_connect.on_channel_connect(req, conn_id))
+                                    .catch_unwind()
+                                    .await
+                                    .is_err()
+                                {
+                                    socket_status_for_connect.store(SocketStatus::to_u64(SocketStatus::Fresh), Ordering::Relaxed);
+                                    if let Err(_e) = on_channel_disconnect_for_cancel(conn_id) {
+                                        eprintln!("Error with cancelling of channel connection");
+                                    }
+                                    disconnect_for_connect.cancel();
+    
+                                    return Err(String::from("Cannot complete"))
+                                }
+
+                                socket_status_for_connect.store(SocketStatus::to_u64(status), Ordering::Relaxed);
+
+                                Ok(())
                             }),
                             Arc::new(move || {
                                 let status = SocketStatus::from_u64(
@@ -315,7 +336,7 @@ async fn handle_cmd<F, T>(
     on_channel_disconnect: Arc<T>,
 ) -> Option<Response>
 where
-    F: Fn() -> Result<u32, String> + Send + Sync + 'static,
+    F: AsyncFn(Request) -> Result<(), String> + Send + Sync + 'static,
     T: Fn() + Send + Sync + 'static,
 {
     let req_id = cmd.headers.req_id;
@@ -345,30 +366,17 @@ where
             }
             RequestOpcode::ChannelConnect => {
                 if cmd.route == ReservedRoutes::CHANNEL_CONNECT.as_bytes() {
-                    let conn_id = match on_channel_connect() {
-                        Ok(s) => s,
-                        Err(e) => {
+                    if let Err(e) = on_channel_connect(cmd).await {
                             let mut response = Response::internal_error(req_id);
                             response.payload = Bytes::from(e);
                             return Some(response);
-                        }
-                    };
-
-                    if AssertUnwindSafe(router.on_channel_connect(cmd, conn_id))
-                        .catch_unwind()
-                        .await
-                        .is_err()
-                    {
-                        on_channel_disconnect();
-                        drop(permit);
-
-                        return Some(Response::internal_error(req_id));
                     }
 
                     drop(permit);
 
                     return Some(Response::channel_connected(req_id));
                 }
+
                 drop(permit);
 
                 return Some(Response::bad_request(
@@ -439,6 +447,10 @@ where
                 return Some(Response::connection_type_mismatch(req_id));
             }
         },
+        SocketStatus::Connecting => {
+            drop(permit);
+            return Some(Response::connection_type_mismatch(req_id));
+        }
     }
 
     None
