@@ -11,6 +11,9 @@ pub struct ChannelHub {
 
 impl ChannelHub {
     pub fn register(&self, id: u32, sender: mpsc::Sender<Response>) -> Result<(), String> {
+        if id == 0 {
+            return Err(String::from("0 can't be channel id"));
+        }
         let mut guard = self
             .channels
             .write()
